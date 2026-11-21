@@ -443,6 +443,39 @@ def test_B9a_the_count_is_the_same_for_a_pure_deletion():
     assert out.kind == "updated" and out.changed_lines == ADDED_LINES
 
 
+def _render_with(items: str) -> str:
+    return f"# Rules\n\nFirst rule.\n\n## Section\n\n{items}\n## Tail\n\nlast line\n"
+
+
+def test_B9a_definition_replacing_two_lines_by_three_counts_three():
+    """B9a: changed_lines is, per non-equal block of a line-by-line comparison, the LARGER of the lines
+    removed and the lines added. Two lines replaced by three is 3 (a +/- line count would say 5, an
+    'added only' count 3 but 0 for a deletion)."""
+    blk = _blk()
+    old = _render_with("- item one\n- item two\n")
+    new = _render_with("- new a\n- new b\n- new c\n")
+    out = blk.merge(blk.wrap(old), new)
+    assert out.kind == "updated" and out.changed_lines == 3
+    assert UPDATED_RE.match(out.line).group(1) == "3"
+
+
+def test_B9a_definition_an_equal_count_change_counts_that_count_not_double():
+    """B9a: two lines replaced by two is 2, not 4. A count of removed plus added lines would say 4."""
+    blk = _blk()
+    old = _render_with("- item one\n- item two\n")
+    new = _render_with("- other a\n- other b\n")
+    assert blk.merge(blk.wrap(old), new).changed_lines == 2
+
+
+def test_B9a_definition_separate_blocks_add_up():
+    """B9a: the sum runs over EVERY non-equal block. One line changed near the top (1) and one line replaced
+    by three further down (3) is 4; counting only the largest block would say 3."""
+    blk = _blk()
+    old = "# Rules\n\nFirst rule.\n\n## Section\n\n- keep one\n- keep two\n- keep three\n\n## Tail\n\nlast line\n"
+    new = "# Rules\n\nFirst rule, reworded.\n\n## Section\n\n- keep one\n- keep two\n- keep three\n\n## Tail\n\nx 1\nx 2\nx 3\n"
+    assert blk.merge(blk.wrap(old), new).changed_lines == 4
+
+
 def test_B9a_control_a_crlf_converted_block_is_still_state_a_not_an_edit():
     """B9 control / E7 / M18: an editor that converted the whole file to CRLF did not edit the body.
     CRLF read as LF gives the same hash, so the block is replaced (and the text outside keeps its

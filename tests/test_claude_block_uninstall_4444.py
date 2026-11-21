@@ -24,6 +24,8 @@ python is a recording shim planted in the fake home that runs the repo's own int
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 import shutil
 import stat
@@ -66,12 +68,24 @@ def _md(rig) -> Path:
     return rig.claude_home / "CLAUDE.md"
 
 
-def _setup(rig, current: bytes, pre_engram: bytes | None = STALE) -> Path:
+def _write_record(rig, path: Path, sha256: str) -> Path:
+    """This ENGRAM home's record of the block it wrote (B12): exactly two keys, path and sha256."""
+    rec = rig.eh / "claude-md-block.json"
+    rec.write_text(json.dumps({"path": os.path.realpath(path), "sha256": sha256}), encoding="utf-8")
+    return rec
+
+
+def _setup(rig, current: bytes, pre_engram: bytes | None = STALE, record: str = "match") -> Path:
+    """Plant CLAUDE.md (and the stale first copy). record="match" also writes this home's record (D6)
+    naming this file and the hash in the file's first BEGIN line; record=None writes none."""
     rig.claude_home.mkdir(parents=True, exist_ok=True)
     md = _md(rig)
     md.write_bytes(current)
     if pre_engram is not None:
         (rig.claude_home / "CLAUDE.md.pre-engram").write_bytes(pre_engram)
+    m = re.search(rb"engram:begin sha256=([0-9a-f]{64})", current)
+    if record == "match" and m:
+        _write_record(rig, md, m.group(1).decode())
     return md
 
 
@@ -312,3 +326,76 @@ def test_D5_a_missing_or_failing_venv_python_leaves_the_file_untouched_with_one_
     assert md.read_bytes() == data
     named = _lines_naming(out, md)
     assert len(named) == 1 and re.search(r"python|venv", named[0], re.I), named
+
+
+# ------------------------------------------------------------------------------ D6
+
+def _d6_planted():
+    original = b"my rules\nsecond line\n"
+    return original, original + b"\n" + _hand_block()
+
+
+def _assert_left_and_named(rig, md, planted, out):
+    assert md.read_bytes() == planted, "uninstall acted on a block this home has no matching record for"
+    named = _lines_naming(out, md)
+    assert len(named) == 1, named
+    assert re.search(r"record", named[0], re.I), named
+    assert (rig.claude_home / "CLAUDE.md.pre-engram").read_bytes() == STALE, "the stale first copy was restored over it"
+
+
+def test_D6_cell1_no_record_in_this_home_leaves_a_valid_block_alone_and_names_the_file(rig):
+    """D6 cell 1: a scratch ENGRAM home with NO record and an account file that carries a valid block: the file
+    is left untouched and ONE line names it and says no record in this home names the block. Uninstall that
+    acted on markers alone would cut a block that another ENGRAM home wrote (M26)."""
+    _, planted = _d6_planted()
+    md = _setup(rig, planted, record=None)
+    out = _run(rig)
+    _assert_left_and_named(rig, md, planted, out)
+    assert "no record in this ENGRAM home names this file's block" in " ".join(out.split())
+
+
+def test_D6_cell2_a_record_naming_a_different_path_leaves_the_file_alone_and_names_it(rig):
+    """D6 cell 2: the record names ANOTHER CLAUDE.md: left untouched, one line (M27). A record for some other
+    account's file must never authorise cutting this one."""
+    _, planted = _d6_planted()
+    md = _setup(rig, planted, record=None)
+    sha = re.search(rb"sha256=([0-9a-f]{64})", planted).group(1).decode()
+    _write_record(rig, rig.tmp / "somewhere-else" / "CLAUDE.md", sha)
+    _assert_left_and_named(rig, md, planted, _run(rig))
+
+
+def test_D6_cell3_a_record_whose_hash_differs_from_the_begin_hash_leaves_the_file_alone(rig):
+    """D6 cell 3: the recorded hash is not the BEGIN line's (the block was edited or replaced since): left
+    untouched, one line; uninstall never guesses and the user's edits stay (M28)."""
+    _, planted = _d6_planted()
+    md = _setup(rig, planted, record=None)
+    _write_record(rig, md, "f" * 64)
+    _assert_left_and_named(rig, md, planted, _run(rig))
+
+
+def test_D6_cell4_the_matching_record_lets_the_block_go_after_the_pre_uninstall_copy(rig):
+    """D6 cell 4: the record names this path and the BEGIN hash: the current file is saved to
+    `.pre-uninstall.<UTC>` and then only the block and its blank line are removed."""
+    original, planted = _d6_planted()
+    md = _setup(rig, planted, record=None)
+    sha = re.search(rb"sha256=([0-9a-f]{64})", planted).group(1).decode()
+    _write_record(rig, md, sha)
+    out = _run(rig)
+    saved = _saved(rig)
+    assert len(saved) == 1 and saved[0].read_bytes() == planted and str(saved[0]) in out
+    assert md.read_bytes() == original
+
+
+def test_D6_cell4b_paths_are_compared_as_real_paths(rig, tmp_path):
+    """D6: 'compared as real paths'. CLAUDE_HOME is a symlink to the real folder and the record holds the
+    real path: it still matches, so the block goes. A string comparison would leave it."""
+    real = rig.tmp / "real-claude-home"
+    real.mkdir()
+    rig.claude_home.symlink_to(real)
+    original, planted = _d6_planted()
+    (real / "CLAUDE.md").write_bytes(planted)
+    (real / "CLAUDE.md.pre-engram").write_bytes(STALE)
+    sha = re.search(rb"sha256=([0-9a-f]{64})", planted).group(1).decode()
+    _write_record(rig, real / "CLAUDE.md", sha)
+    _run(rig)
+    assert (real / "CLAUDE.md").read_bytes() == original

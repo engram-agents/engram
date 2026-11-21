@@ -843,6 +843,121 @@ def test_B11_control_a_file_with_a_different_older_text_is_appended_not_refused(
     _split_block(md.read_bytes())
 
 
+# ------------------------------------------------------------------------------ B12 (the record)
+
+RECORD_NAME = "claude-md-block.json"
+
+
+def _record_path(tmp_path: Path) -> Path:
+    return tmp_path / ".engram" / RECORD_NAME
+
+
+def _begin_hash(data: bytes) -> str:
+    m = re.search(re.escape(BEGIN_LIT) + rb"([0-9a-f]{64})", data)
+    assert m, "no BEGIN line with a hash in the file (stage 2 not built)"
+    return m.group(1).decode()
+
+
+def _assert_record_matches(tmp_path: Path) -> dict:
+    rec = _record_path(tmp_path)
+    assert rec.is_file(), f"{RECORD_NAME} was not written in the ENGRAM home"
+    doc = json.loads(rec.read_text(encoding="utf-8"))
+    assert set(doc) == {"path", "sha256"}, f"exactly two keys expected, got {sorted(doc)}"
+    md = _md(tmp_path)
+    assert doc["path"] == os.path.realpath(md), "path is not the real path of the CLAUDE.md"
+    assert doc["sha256"] == _begin_hash(md.read_bytes()), "sha256 is not the hash in the BEGIN line"
+    return doc
+
+
+@pytest.mark.parametrize("merge", [pytest.param([], id="no_flag"), pytest.param(["--merge"], id="merge")])
+@pytest.mark.parametrize("prof", PROFILES)
+def test_B12_a_created_file_writes_the_record(tmp_path, prof, merge):
+    """B12: an absent CLAUDE.md that bootstrap creates (with or without --merge) also writes
+    `<ENGRAM_HOME>/claude-md-block.json` with exactly two keys, the real path and the BEGIN line's hash.
+    Without the record, uninstall (D6) could never tell this home wrote the block."""
+    _install(tmp_path, prof, extra_args=merge)
+    _assert_record_matches(tmp_path)
+
+
+@pytest.mark.parametrize("prof", PROFILES)
+def test_B12_an_appended_block_writes_the_record(tmp_path, prof):
+    """B12: appending a block to the user's file writes the record (path + the new BEGIN hash)."""
+    _plant(tmp_path, b"my own rules\n")
+    _ok(_run(tmp_path, [*prof, "--merge"]))
+    _assert_record_matches(tmp_path)
+
+
+@pytest.mark.parametrize("prof", PROFILES)
+def test_B12_an_updated_block_writes_the_record_with_the_new_hash(tmp_path, prof):
+    """B12: an updated block (state (a)) rewrites the record with the NEW hash, not the old one. A record
+    kept from the first install would not match the file and uninstall would leave the block (M30)."""
+    base = _baseline(tmp_path, prof)
+    old_hash = _begin_hash(base)
+    _plant(tmp_path, b"top\n\n" + _split_block(base)[1])
+    _ok(_run(tmp_path, [*prof, "--merge"], templates=_templates_with_extra(tmp_path)))
+    doc = _assert_record_matches(tmp_path)
+    assert doc["sha256"] != old_hash
+
+
+@pytest.mark.parametrize("prof", PROFILES)
+def test_B12_an_identical_run_writes_no_record(tmp_path, prof):
+    """B12: 'not on identical'. After the data home is set aside, a run over a file that already equals the
+    new text writes nothing, so no record appears."""
+    _install(tmp_path, prof)
+    _assert_record_matches(tmp_path)  # the first (creating) run did write one
+    _fresh_data_home(tmp_path)
+    _ok(_run(tmp_path, prof))
+    assert not _record_path(tmp_path).exists()
+
+
+REFUSAL_KINDS = ["two_blocks", "edited_block", "verbatim_text", "codex_target", "replace_other_path"]
+
+
+@pytest.mark.parametrize("planted", [pytest.param(None, id="no_record"), pytest.param(b'{"path": "x", "sha256": "y"}\n', id="existing_record")])
+@pytest.mark.parametrize("prof", PROFILES)
+@pytest.mark.parametrize("kind", REFUSAL_KINDS)
+def test_B12_a_refused_run_writes_no_record_and_keeps_an_existing_one_byte_for_byte(tmp_path, prof, kind, planted):
+    """B12: a refused run (B4, B9(b), B11, C4, C4b) writes no record and does not change an existing one.
+    If the record were written before the refusal (M29), uninstall would later trust a block this run
+    never wrote."""
+    if kind == "two_blocks":
+        data, _ = B4_SHAPES["two_blocks"]
+    elif kind == "edited_block":
+        data = _edit_inside(_split_block(_baseline(tmp_path, prof))[1], b"MY OWN EDIT\n")
+    elif kind == "verbatim_text":
+        render = _split_block(_baseline(tmp_path, prof))[3]
+        data = b"intro\n\n" + render
+    else:
+        data = b"my own rules\n"
+    md = _plant(tmp_path, data)
+    _home(tmp_path)
+    rec = _record_path(tmp_path)
+    if planted is not None:
+        rec.write_bytes(planted)
+    args, target = [*prof, "--merge"], "claude"
+    if kind == "codex_target":
+        args, target = ["--merge"], "codex"
+    elif kind == "replace_other_path":
+        args = [*prof, "--merge", "--replace", str(tmp_path / "other.md")]
+    r = _run(tmp_path, args, target=target)
+    assert "unknown argument" not in _out(r), f"--merge is not implemented yet: {_out(r)}"
+    assert r.returncode != 0
+    assert md.read_bytes() == data
+    if planted is None:
+        assert not rec.exists(), "a refused run created the record"
+    else:
+        assert rec.read_bytes() == planted, "a refused run changed the record"
+
+
+def test_B12_the_record_name_is_in_the_guards_owned_names():
+    """B12: the file is ENGRAM's own bookkeeping, listed among the guard's owned names (rewritten when it
+    differs, never backed up). Without the entry the guard would refuse to rewrite it or back it up."""
+    if str(SRC) not in sys.path:
+        sys.path.insert(0, str(SRC))
+    import engram_file_guard as fg
+    assert RECORD_NAME in fg.ENGRAM_OWNED_NAMES
+
+
 # ------------------------------------------------------------------------------ A2 (file level)
 
 @pytest.mark.parametrize("prof", PROFILES)
