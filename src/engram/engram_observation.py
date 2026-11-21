@@ -2466,7 +2466,8 @@ def _add_observation_impl(
 
         # --- Stage 1 auto-suggest: person-mention detection (§4 of person typed schema) ---
         # Scan the new claim text against name + aliases of every current person node.
-        # On match, add an action-hint suggesting the caller wire an about-edge.
+        # On match, list the person in `person_mentions` (id and name; #4847 removed the old
+        # "wire an about-edge?" message text, the tool description says what a mention means).
         #
         # CRITICAL CONSTRAINT: mentions ≠ about; name-match is necessary but not
         # sufficient — the caller confirms whether the claim is actually ABOUT the

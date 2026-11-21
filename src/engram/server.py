@@ -1823,21 +1823,29 @@ def engram_add_observation(payload_json: str) -> str:
 
     Reading the reply. The similar-node block (`similar_existing_lead`,
     `similar_existing`) is similarity-graded and source-aware, one severity per
-    match: `duplicate` and `polarity_alert` (full entry: act on these),
-    `corroborate`, `keyword_overlap_same_source` and `distinct_from_same_source`
-    (id, scent, confidence), `related` and `keyword_overlap_other_source` (id and
-    keywords), `weak_match` (counted in `similar_not_shown` only).
+    match. From a different source: `corroborate` (high similarity: independent
+    support for the claim), `related` (moderate similarity),
+    `keyword_overlap_other_source` (a keyword match with no similarity score) and
+    `weak_match` (low similarity; counted in `similar_not_shown` only). From the
+    same source: `duplicate`, `distinct_from_same_source` and
+    `keyword_overlap_same_source`. `polarity_alert` marks a match whose claim the
+    contradiction check finds to be the opposite of this one. Entry shapes:
+    `duplicate` and `polarity_alert` come in full (act on these); `corroborate`,
+    `keyword_overlap_same_source` and `distinct_from_same_source` carry `id`,
+    `severity`, `recall_summary` and `confidence`; `related` and
+    `keyword_overlap_other_source` carry `id`, `severity` and `keywords`.
     `similar_existing_lead` names the action once, for the severities present.
     `duplicate` fires at similarity 0.85 or more within one document or web page,
     and only at 0.92 or more within a long-running source (a conversation or a
-    file); a semantic same-source match under that is `distinct_from_same_source`, usually
-    a different fact, and a keyword-only one is `keyword_overlap_same_source`. `anchoring_advisory` carries the measurements plus `flags`:
-    `hard_data_unanchored` (a hard_data claim has tokens the quote lacks: widen
-    the quote, move the fact to interpretation, or downgrade quote_type) and
-    `low_similarity` (quote-claim similarity under 0.2: widen the quote, narrow
-    the claim, or derive it from premises). `person_mentions` lists person nodes
-    whose name appears in the claim; a mention is not aboutness, so link with
-    engram_link_about only when the claim is about that person.
+    file); a semantic same-source match under that is `distinct_from_same_source`,
+    usually a different fact, and a keyword-only one is
+    `keyword_overlap_same_source`. `anchoring_advisory` carries the measurements
+    plus `flags`: `hard_data_unanchored` (a hard_data claim has tokens the quote
+    lacks: widen the quote, move the fact to interpretation, or downgrade
+    quote_type) and `low_similarity` (quote-claim similarity under 0.2: widen the
+    quote, narrow the claim, or derive it from premises). `person_mentions` lists
+    person nodes whose name appears in the claim; a mention is not aboutness, so
+    link with engram_link_about only when the claim is about that person.
 
     Worked examples, the quote-verification workflow, quote_type/source_class
     selection, node-grain guidance, and the advisory response keys: the

@@ -189,7 +189,9 @@ def test_d_tool_description_states_the_corrected_content():
     assert "0.85" in para and "0.92" in para, "both duplicate thresholds"
     assert "conversation or a" in para and "file" in para, "duplicate also fires for long-running sources"
     for needle in ("hard_data_unanchored", "low_similarity", "person_mentions", "engram_link_about",
-                   "similar_not_shown", "weak_match"):
+                   "similar_not_shown", "weak_match",
+                   # found by the peer read: what the other-source severities ARE, and the real key name
+                   "different source", "independent", "recall_summary", "keyword_overlap_other_source"):
         assert needle in para, needle
 
 
