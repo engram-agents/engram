@@ -11816,11 +11816,17 @@ SIMILAR_TIER_C_MAX_ENTRIES = 5
 SIMILAR_TIER_C_MAX_KEYWORDS = 5
 SIMILAR_RECALL_SUMMARY_FALLBACK_CHARS = 140
 SIMILAR_LEAD_MAX_IDS = 3
-# Leading-line phrases, in the order they are said: (severity, singular, plural).
+# Leading-line phrases, in the order they are said: (severity, singular, plural,
+# action). The action is said HERE, once, and only for a severity present in the
+# reply (#4847, D2); a tier-B entry no longer repeats it. Tier A keeps its own
+# prose per entry (D1), so for those two the lead is the short form of it.
 _SIMILAR_LEAD_PHRASES = (
-    ("polarity_alert", "polarity alert", "polarity alerts"),
-    ("duplicate", "duplicate candidate", "duplicate candidates"),
-    ("corroborate", "corroboration candidate", "corroboration candidates"),
+    ("polarity_alert", "polarity alert", "polarity alerts",
+     "check whether they contradict"),
+    ("duplicate", "duplicate candidate", "duplicate candidates",
+     "inspect both; retract the new one if it only repeats"),
+    ("corroborate", "corroboration candidate", "corroboration candidates",
+     "derive an inductive_generalization citing the new node and the candidate"),
 )
 
 
@@ -11896,12 +11902,13 @@ def _render_similar_block(entries: list[dict]) -> tuple[str, list[dict], dict]:
                 if k not in _SIMILAR_STRIP_KEYS and k not in _SIMILAR_RAW_RECALL_KEYS}
         shown.append(full)
     for e in tier_b:
+        # #4847 (D2): no action_hint prose, and with it no similarity figure (it
+        # lived only in that prose); the severity word already encodes the band.
         shown.append({
             "id": e["id"],
             "severity": e["severity"],
             "recall_summary": _similar_scent(e),
             "confidence": e.get("confidence"),
-            "action_hint": e.get("action_hint", ""),
         })
     for e in tier_c[:SIMILAR_TIER_C_MAX_ENTRIES]:
         shown.append({
@@ -11913,7 +11920,7 @@ def _render_similar_block(entries: list[dict]) -> tuple[str, list[dict], dict]:
 
     # Leading line: what needs action. At most 3 ids per phrase, rest counted.
     phrases = []
-    for sev, singular, plural in _SIMILAR_LEAD_PHRASES:
+    for sev, singular, plural, action in _SIMILAR_LEAD_PHRASES:
         ids = [e["id"] for e in entries if e.get("severity") == sev]
         if not ids:
             continue
@@ -11921,7 +11928,7 @@ def _render_similar_block(entries: list[dict]) -> tuple[str, list[dict], dict]:
             ids[:SIMILAR_LEAD_MAX_IDS])
         if len(ids) > SIMILAR_LEAD_MAX_IDS:
             text += f" and {len(ids) - SIMILAR_LEAD_MAX_IDS} more"
-        phrases.append(text)
+        phrases.append(f"{text} ({action})")
     lead = "; ".join(phrases) if phrases else "nothing needs action"
 
     not_shown: dict = {}

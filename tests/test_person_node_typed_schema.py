@@ -456,7 +456,10 @@ def test_stage1_person_mention_suggestion_fires():
     assert len(pms) >= 1
     match = next((p for p in pms if p["person_name"] == "Valentina"), None)
     assert match is not None, f"Valentina not in person_mentions: {pms}"
-    assert "wire an about-edge?" in match["message"]
+    # #4847 (D4), changed on purpose: the "wire an about-edge?" sentence was the same on every
+    # mention and is gone; person_id and person_name stay (what a mention means is in the tool
+    # description).
+    assert "message" not in match and match["person_id"].startswith("pn_")
 
     # CRITICAL: no about-edge was auto-wired
     import engram_core as core
