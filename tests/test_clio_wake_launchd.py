@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 import xml.dom.minidom
@@ -312,30 +313,78 @@ class TestStaleLoopMarkerHandling:
             assert "moved stale loop marker aside" not in log.read_text(encoding="utf-8")
 
 
+def _start_failing_pane(tmp_path: Path) -> tuple[subprocess.Popen, Path, Path]:
+    """Start clio-wake-run.sh against a stub agentctl that exits 7.
+
+    Returns (proc, home, pidfile). A stub `sleep` on PATH records its own pid
+    in pidfile, then execs the real sleep, so a test can tell whether the
+    script's hold-the-pane sleep outlived the stop (engram-alpha#4935).
+    """
+    home = _make_home(tmp_path)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    charge_dir = tmp_path / "charge"
+    charge_dir.mkdir()
+    (charge_dir / "wake-charge-clio.md").write_text("test charge content, mentions engram-alpha#3002", encoding="utf-8")
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    pidfile = tmp_path / "sleep.pid"
+
+    _write_stub(bin_dir / "agentctl", "exit 7")
+    _write_stub(bin_dir / "sleep", f'echo $$ > "{pidfile}"\nexec /bin/sleep "$@"')
+
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["PATH"] = f"{bin_dir}:{os.environ['PATH']}"
+
+    proc = subprocess.Popen(
+        ["/bin/bash", str(RUN), str(charge_dir), str(cwd)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        # Own session, so the pane's process group is its own: _stop_pane's
+        # killpg can then never reach the test runner (engram-alpha#4935).
+        start_new_session=True,
+    )
+    return proc, home, pidfile
+
+
+def _stop_pane(proc: subprocess.Popen) -> None:
+    """Stop the pane and everything it started (bash and its sleep child).
+
+    proc.kill() alone kills only the bash; the script's hold `sleep` is a
+    child in the same process group and would survive, re-parented to pid 1.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait(timeout=5)
+
+
+def _wait_for_pidfile(pidfile: Path, timeout: float = 5.0) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pidfile.exists():
+            text = pidfile.read_text(encoding="utf-8").strip()
+            if text:
+                return int(text)
+        time.sleep(0.05)
+    raise AssertionError(f"stub sleep never recorded a pid in {pidfile}")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 class TestRunPaneHoldOnFailure:
     def test_holds_pane_and_logs_on_agentctl_failure(self, tmp_path: Path) -> None:
-        home = _make_home(tmp_path)
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
-        charge_dir = tmp_path / "charge"
-        charge_dir.mkdir()
-        (charge_dir / "wake-charge-clio.md").write_text("test charge content, mentions engram-alpha#3002", encoding="utf-8")
-        cwd = tmp_path / "project"
-        cwd.mkdir()
-
-        _write_stub(bin_dir / "agentctl", "exit 7")
-
-        env = dict(os.environ)
-        env["HOME"] = str(home)
-        env["PATH"] = f"{bin_dir}:{os.environ['PATH']}"
-
-        proc = subprocess.Popen(
-            ["/bin/bash", str(RUN), str(charge_dir), str(cwd)],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        proc, home, _ = _start_failing_pane(tmp_path)
         try:
             # The script must hold the pane (sleep infinity) rather than
             # exiting — give it a moment then confirm it is STILL ALIVE,
@@ -343,14 +392,34 @@ class TestRunPaneHoldOnFailure:
             time.sleep(2)
             assert proc.poll() is None, "process must still be holding the pane, not exited"
         finally:
-            proc.kill()
-            proc.wait(timeout=5)
+            _stop_pane(proc)
 
         log = home / ".engram" / "logs" / "clio-wake.log"
         assert log.exists()
         log_text = log.read_text(encoding="utf-8")
         assert "launching:" in log_text
         assert "exited ec=7" in log_text
+
+    def test_stopping_the_held_pane_leaves_no_sleep_behind(self, tmp_path: Path) -> None:
+        """engram-alpha#4935: killing only the bash left the hold `sleep` alive."""
+        proc, _, pidfile = _start_failing_pane(tmp_path)
+        sleep_pid = None
+        try:
+            sleep_pid = _wait_for_pidfile(pidfile)
+            assert _pid_alive(sleep_pid), "the hold sleep must be running while the pane is held"
+            _stop_pane(proc)
+            deadline = time.monotonic() + 2
+            while _pid_alive(sleep_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not _pid_alive(sleep_pid), f"hold sleep pid {sleep_pid} outlived the pane stop"
+        finally:
+            if sleep_pid is not None and _pid_alive(sleep_pid):
+                try:
+                    os.kill(sleep_pid, 9)  # the recorded pid only
+                except ProcessLookupError:
+                    pass
+            if proc.poll() is None:
+                _stop_pane(proc)
 
 
 class TestWakeCharge:
