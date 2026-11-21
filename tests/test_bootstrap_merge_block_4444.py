@@ -986,6 +986,31 @@ def test_B12_a_record_that_cannot_be_written_is_one_line_after_claude_md_was_wri
     assert (tmp_path / ".engram" / RECORD_NAME).is_dir()
 
 
+def test_B12_an_unwritable_record_is_still_said_when_the_retention_step_also_fails(tmp_path):
+    """B12: the record line must not be lost when the LAST step (`--retention-days`) also exits. A folder at the
+    record name plus a read-only settings.json (valid JSON the preflight accepts, a write that then fails; no
+    root) makes both fail. Both lines must be visible and the exit non-zero; if only the retention line showed,
+    the user would never learn that uninstall now leaves the block in place."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root ignores file modes, so settings.json cannot be made unwritable here")
+    (tmp_path / ".engram").mkdir(exist_ok=True)
+    (tmp_path / ".engram" / RECORD_NAME).mkdir()
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_bytes(b'{"theme": "dark"}\n')
+    os.chmod(settings, 0o444)
+    try:
+        r = _run(tmp_path, ["--retention-days", "90"])
+    finally:
+        os.chmod(settings, 0o644)
+    out = _out(r)
+    assert "Traceback" not in out, out
+    assert r.returncode != 0, out
+    assert [ln for ln in out.splitlines() if "CLAUDE.md was written" in ln and RECORD_NAME in ln], out
+    assert [ln for ln in out.splitlines() if "settings.json" in ln and "REFUSED" in ln], out  # the retention step's own refusal
+    _split_block(_md(tmp_path).read_bytes())
+
+
 def test_B12_the_record_name_is_in_the_guards_owned_names():
     """B12: the file is ENGRAM's own bookkeeping, listed among the guard's owned names (rewritten when it
     differs, never backed up). Without the entry the guard would refuse to rewrite it or back it up."""

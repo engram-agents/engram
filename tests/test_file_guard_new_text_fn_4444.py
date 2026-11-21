@@ -336,6 +336,7 @@ print(json.dumps({"survived": b"user_edit = true" in final, "raised": raised,
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,  # only the lost-update assertion below raises it; a broken probe raises RuntimeError and goes red
     reason="issue 4939: the Codex config.toml item still passes a fixed text computed before apply, so an edit "
            "made after the check-only pass is lost; remove this marker when the Codex item moves to new_text_fn",
 )
@@ -360,10 +361,12 @@ def test_measure_codex_item_stale_text_4939(tmp_path):
     })
     r = subprocess.run([sys.executable, "-c", _CODEX_PROBE, str(SRC), str(cfg)],
                        env=env, capture_output=True, text=True, timeout=120)
-    assert r.returncode == 0, r.stdout + r.stderr
+    if r.returncode != 0:  # a broken probe is not the measurement: RuntimeError is not the xfail's `raises`
+        raise RuntimeError("the 4939 probe itself failed:\n" + r.stdout + r.stderr)
     result = json.loads(r.stdout.strip().splitlines()[-1])
     assert result["survived"], (
-        "MEASUREMENT (4939): the user's edit made after the check-only pass was LOST by apply; "
+        "MEASUREMENT (4939): the user's edit (the `[plugins.added_after_the_check]` stanza with "
+        "`user_edit = true`, appended after the check-only pass) was LOST by apply; "
         f"raised={result['raised']}; backups={result['backups']}; final head={result['final_head']!r}; "
         f"final tail={result['final_tail']!r}"
     )

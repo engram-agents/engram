@@ -396,6 +396,24 @@ def test_D6_cell4_the_matching_record_lets_the_block_go_after_the_pre_uninstall_
     assert md.read_bytes() == original
 
 
+def test_D6_documents_that_the_hash_is_the_begin_line_hash_so_a_body_edit_goes_with_the_block_but_stays_in_the_copy(rig):
+    """D6 (documents the choice, green by design): the recorded hash is compared with the hash in the BEGIN
+    LINE, not with a fresh hash of the body. A block whose BODY was edited by hand but whose BEGIN line is
+    unchanged, with a matching record, is therefore removed with the rest of the block; the text outside it is
+    kept, and the edit inside survives only in the `.pre-uninstall.<UTC>` copy (saved first). If a later change
+    made uninstall hash the body, this cell would go red and the contract line would need a ruling."""
+    original = b"my rules\nsecond line\n"
+    planted = original + b"\n" + _hand_block()
+    md = _setup(rig, planted)  # the record holds the BEGIN line's hash
+    edited = planted.replace(b"First rule.", b"First rule, EDITED BY HAND.")
+    assert edited != planted
+    md.write_bytes(edited)
+    out = _run(rig)
+    assert md.read_bytes() == original, "the block (edit included) goes, the outside text stays"
+    saved = _saved(rig)
+    assert len(saved) == 1 and saved[0].read_bytes() == edited and str(saved[0]) in out
+
+
 def test_D6_cell4b_paths_are_compared_as_real_paths(rig, tmp_path):
     """D6: 'compared as real paths'. CLAUDE_HOME is a symlink to the real folder and the record holds the
     real path: it still matches, so the block goes. A string comparison would leave it."""

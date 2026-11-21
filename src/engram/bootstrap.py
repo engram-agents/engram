@@ -1333,6 +1333,10 @@ def main() -> None:
     record_problem = None
     if TARGET == "claude" and CLAUDE_HOME / "CLAUDE.md" in written:
         record_problem = _write_claude_record(CLAUDE_HOME / "CLAUDE.md")
+        if record_problem is not None:
+            # Said now, not at the end: the settings step below can exit with its own message, and this line
+            # (uninstall will leave the block in place) must not be lost behind it.
+            print(record_problem, file=sys.stderr, flush=True)
     for item in final_items:
         if item.path in written:
             print(f"  {item.path.name} → {item.path}", flush=True)
@@ -1367,10 +1371,9 @@ def main() -> None:
                 "(settings.json was not touched)",
                 flush=True,
             )
-    # Last, like the settings step: everything else is done, so the exit status is the only thing left to say
-    # that CLAUDE.md was written but its record was not (one line; the same non-zero exit a refused item gets).
+    # Everything else is done; the record line was already printed, so only the non-zero exit is left.
     if record_problem is not None:
-        raise SystemExit(record_problem)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
