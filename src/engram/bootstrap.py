@@ -81,6 +81,7 @@ CODEX_HOME = Path(os.environ["CODEX_HOME"]) if TARGET == "codex" else None
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import server  # noqa: E402
 import engram_file_guard as fg  # noqa: E402
+import engram_claude_block as blk  # noqa: E402
 import engram_config_io  # noqa: E402
 
 
@@ -676,17 +677,26 @@ def _record_claude_md_profile(profile: "str | None") -> None:
         )
 
 
+def _wrap_claude_render(render: str) -> str:
+    """The text bootstrap writes to CLAUDE.md for a rendered template: the render inside ENGRAM's block. A
+    template that holds the marker text fails here, before anything is written (A3)."""
+    try:
+        return blk.wrap(render)
+    except ValueError as e:
+        raise SystemExit(f"[bootstrap] REFUSED: {e}. Nothing was written.")
+
+
 def _predicted_claude_render(profile: "str | None" = None) -> str | None:
-    """What this run would write to CLAUDE.md, for the check-only pass.
+    """What this run would write to CLAUDE.md (the render inside the block), for the check-only pass.
 
     The seed IDs are fixed (`_FIXED_SEED_IDS`), so no seed manifest is read. An unreadable
     template -> None.
     """
     try:
-        return _render_template_text(
+        return _wrap_claude_render(_render_template_text(
             _claude_template_path(profile),
             _build_substitutions(dict(_FIXED_SEED_IDS), quiet=True),
-        )
+        ))
     except OSError:
         return None
 
@@ -720,6 +730,41 @@ def _read_existing_text(path: Path) -> str:
         )
 
 
+# #4444: what this run does with CLAUDE.md, set once by main() from the command line. `outcome` is the last
+# merge result (the guard calls the merge function again at write time; the last call is the one that wrote).
+_CLAUDE_MODE = {"merge": False, "overwrite": False, "outcome": None}
+CLAUDE_MD_RECORD_NAME = "claude-md-block.json"  # B12: this home's record of the block it wrote (also in fg.ENGRAM_OWNED_NAMES)
+
+
+def _claude_item(path: Path, wrapped: "str | None") -> "fg.Item":
+    """The CLAUDE.md item. `wrapped` is the predicted (or real) render already wrapped in the block (one
+    function, `blk.wrap`, makes it: E4). Without --merge the whole file is that text (today's behaviour). With
+    --merge the text is a function of the bytes the guard reads at write time (B8): `blk.merge` on them."""
+    if wrapped is None or not _CLAUDE_MODE["merge"]:
+        return fg.Item(path, wrapped, first_identity=True)
+    render = blk.unwrap(wrapped)
+
+    def merged(current: str) -> str:
+        out = blk.merge(current if current != "" else None, render, overwrite_edited_block=_CLAUDE_MODE["overwrite"])
+        _CLAUDE_MODE["outcome"] = out
+        return out.text
+    return fg.Item(path, wrapped, first_identity=True, new_text_fn=merged)
+
+
+def _write_claude_record(claude_md: Path) -> None:
+    """B12: after CLAUDE.md was written, record which file and which block hash this home wrote (the
+    uninstaller acts on a block only when this record matches, D6). Two keys, ENGRAM's own bookkeeping."""
+    try:
+        text = claude_md.read_bytes().decode("utf-8")
+        digest = blk.block_hash(text)
+    except (OSError, UnicodeDecodeError, blk.MergeRefused):
+        digest = None
+    if digest is None:
+        return  # not a block ENGRAM can vouch for: no record rather than a wrong one
+    record = json.dumps({"path": os.path.realpath(claude_md), "sha256": digest}, indent=2) + "\n"
+    fg.apply(fg.plan([fg.Item(ENGRAM_HOME / CLAUDE_MD_RECORD_NAME, record, owned=True)], home=ENGRAM_HOME))
+
+
 def _write_items(
     ids: dict[str, str], substitutions: dict[str, str], marker_payload: str,
     claude_md_text: "str | None", agents_md_text: "str | None",
@@ -739,7 +784,7 @@ def _write_items(
     ]
     if TARGET == "claude":
         assert CLAUDE_HOME is not None
-        items.append(fg.Item(CLAUDE_HOME / "CLAUDE.md", claude_md_text, first_identity=True))
+        items.append(_claude_item(CLAUDE_HOME / "CLAUDE.md", claude_md_text))
     else:
         assert CODEX_HOME is not None
         compact_text, instructions_body = _codex_texts(substitutions)
@@ -833,6 +878,30 @@ class _Args(NamedTuple):
     consent: "fg.Consent"
     retention_days: "int | None"
     claude_md_profile: "str | None" = None
+    merge: bool = False
+    overwrite: bool = False
+
+
+HELP_TEXT = """usage: bootstrap.py [--force] [--replace PATH] [--merge] [--overwrite-edited-block]
+                    [--retention-days N] [--claude-md-profile NAME]
+
+  --force                   yes to replacing every existing file the refusal lists (after backups)
+  --replace PATH            yes to replacing that one file (repeatable)
+  --merge                   keep your own text in CLAUDE.md: ENGRAM's text goes between two markers and only that
+                            block is rewritten. Text you add belongs outside the markers; anything inside them is
+                            rewritten by the next merge. CLAUDE.md only.
+                            With --force, --merge writes the merge text: a force never discards text outside the
+                            block when --merge is given.
+  --overwrite-edited-block  valid only with --merge. If you edited inside the block, --merge refuses and prints lines of
+                            your own file (a count and the first 40 lines of a diff) to the console, so keep that
+                            output out of shared logs. This flag overwrites the edited block after both backups
+                            are taken.
+  --retention-days N        days Claude Code keeps chat transcripts (1 to 36500)
+  --claude-md-profile NAME  full (default) or local
+
+Known limit: a CLAUDE.md that already holds an OLDER, unwrapped ENGRAM text gets the new block appended by --merge,
+so the ENGRAM text then appears twice; remove the older copy by hand. Only the exact current text is detected.
+"""
 
 
 def _parse_args(argv: list[str]) -> _Args:
@@ -845,13 +914,22 @@ def _parse_args(argv: list[str]) -> _Args:
     (full or local) picks which CLAUDE.md template is rendered; local is for one agent working with one user.
     """
     force = False
+    merge = False
+    overwrite = False
     replace: list[str] = []
     retention_days = None
     claude_md_profile = None
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg == "--force":
+        if arg in ("--help", "-h"):
+            print(HELP_TEXT)
+            raise SystemExit(0)
+        elif arg == "--merge":
+            merge = True
+        elif arg == "--overwrite-edited-block":
+            overwrite = True
+        elif arg == "--force":
             force = True
         elif arg == "--replace":
             if i + 1 >= len(argv):
@@ -886,10 +964,11 @@ def _parse_args(argv: list[str]) -> _Args:
         else:
             raise SystemExit(
                 f"[bootstrap] unknown argument {arg!r}; the options are --force, "
-                f"--replace PATH, --retention-days N and --claude-md-profile NAME"
+                f"--replace PATH, --merge, --overwrite-edited-block, --retention-days N "
+                f"and --claude-md-profile NAME"
             )
         i += 1
-    return _Args(fg.consent_for(force, replace), retention_days, claude_md_profile)
+    return _Args(fg.consent_for(force, replace), retention_days, claude_md_profile, merge, overwrite)
 
 
 def _tighten_home_step() -> None:
@@ -977,6 +1056,27 @@ def main() -> None:
     # flags, distinct from the FORCE env var below, which is about an empty knowledge.db.
     _args = _parse_args(sys.argv[1:])
     consent = _args.consent
+    if _args.overwrite and not _args.merge:
+        raise SystemExit(
+            "[bootstrap] REFUSED: --overwrite-edited-block is valid only together with --merge. Nothing was changed."
+        )
+    if _args.merge:
+        # --merge is consent for the CLAUDE.md path only (the same shape as --replace for that one file).
+        if TARGET != "claude":
+            raise SystemExit(
+                "[bootstrap] REFUSED: --merge is for the Claude target only: the Codex config.toml already merges, "
+                "and AGENTS.md is #4452. Nothing was changed."
+            )
+        claude_md_key = fg._key(CLAUDE_HOME / "CLAUDE.md")
+        others = sorted(p for p in consent.paths if p != claude_md_key)
+        if others:
+            raise SystemExit(
+                f"[bootstrap] REFUSED: --merge works for the CLAUDE.md path only, but --replace names {others[0]}. "
+                f"Nothing was changed."
+            )
+        consent = fg.consent_for(consent.all_paths, [*consent.paths, claude_md_key])
+        _CLAUDE_MODE["merge"] = True
+        _CLAUDE_MODE["overwrite"] = _args.overwrite
 
     # #4445: a bad settings.json is refused before ANYTHING is created (no ENGRAM_HOME, no
     # knowledge.db), so repair + plain re-run works. Read-only apart from the backup copy.
@@ -1013,6 +1113,11 @@ def main() -> None:
     # Back up every consented, differing file NOW: a backup that cannot be written refuses
     # the run while nothing else has changed (no graph seeded, no file replaced).
     backups = fg.save_backups(pre_plan, consent)
+    for original, saved_to in backups.items():
+        print(f"  saved {original} to {saved_to}", flush=True)
+        first = Path(original).parent / (Path(original).name + fg.FIRST_BACKUP_SUFFIX)
+        if fg.target_present(first):
+            print(f"  first-ever copy of {original}: {first}", flush=True)
 
     # In plugin mode, symlink ~/.engram/tools ($ENGRAM_HOME/tools) -> <plugin-root>/tools so that
     # existing skill/agent references to ~/.engram/tools/<file> ($ENGRAM_HOME) (which were
@@ -1194,7 +1299,7 @@ def main() -> None:
     # (the check-only pass judged predicted ones), so a path that changed meanwhile is refused.
     final_items = _write_items(
         ids, substitutions, marker_payload,
-        _render_template_text(_claude_template_path(profile), substitutions) if TARGET == "claude" else None,
+        _wrap_claude_render(_render_template_text(_claude_template_path(profile), substitutions)) if TARGET == "claude" else None,
         _render_template_text(TEMPLATES_DIR / "template.AGENTS.md", substitutions) if TARGET == "codex" else None,
     )
     try:
@@ -1209,6 +1314,15 @@ def main() -> None:
         )
     except fg.Refused as e:
         raise SystemExit(str(e))
+    outcome = _CLAUDE_MODE["outcome"]
+    if _CLAUDE_MODE["merge"] and outcome is not None:
+        saved_copy = backups.get(fg._key(CLAUDE_HOME / "CLAUDE.md"))
+        if outcome.kind == "appended":
+            print("  " + outcome.line, flush=True)
+        elif outcome.kind == "updated" and saved_copy is not None:
+            print(f"  {outcome.line}; the previous file is in {saved_copy}", flush=True)
+    if TARGET == "claude" and CLAUDE_HOME / "CLAUDE.md" in written:
+        _write_claude_record(CLAUDE_HOME / "CLAUDE.md")
     for item in final_items:
         if item.path in written:
             print(f"  {item.path.name} → {item.path}", flush=True)
