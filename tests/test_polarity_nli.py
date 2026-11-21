@@ -385,7 +385,6 @@ def test_polarity_nli_returning_none_is_safe():
     # #4847 (D2), changed on purpose: a tier-B entry carries its severity, no action_hint prose; the lead says the action.
     hint = r["similar_existing"][0]["severity"]
     # No POLARITY_ALERT, but the underlying tier hint must still work
-    assert not hint == "polarity_alert", hint
     assert hint == "corroborate", f"Tier hint must still work: {hint}"
 
 

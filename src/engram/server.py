@@ -1463,8 +1463,8 @@ def _log_engram_tool_event(
 # Certain fields are opaque to agent reasoning and bloat the context window
 # with no semantic gain: embeddings (384-float arrays), content hashes, git
 # SHAs, parsed_metadata (pure redundancy with the raw metadata string), raw
-# match_type + similarity inside similar_existing blocks (action_hint already
-# encodes the actionable summary), and confidence_history (forensics-only).
+# match_type + similarity inside similar_existing blocks (the severity word and
+# the lead's action line carry the actionable summary), and confidence_history (forensics-only).
 #
 # CRITICAL: strip at the AGENT-RETURN boundary only. Internal computation
 # paths (dedup reads embedding/similarity, verifier reads content_hash) must
@@ -1830,8 +1830,8 @@ def engram_add_observation(payload_json: str) -> str:
     `similar_existing_lead` names the action once, for the severities present.
     `duplicate` fires at similarity 0.85 or more within one document or web page,
     and only at 0.92 or more within a long-running source (a conversation or a
-    file); a same-source match under that is `distinct_from_same_source`, usually
-    a different fact. `anchoring_advisory` carries the measurements plus `flags`:
+    file); a semantic same-source match under that is `distinct_from_same_source`, usually
+    a different fact, and a keyword-only one is `keyword_overlap_same_source`. `anchoring_advisory` carries the measurements plus `flags`:
     `hard_data_unanchored` (a hard_data claim has tokens the quote lacks: widen
     the quote, move the fact to interpretation, or downgrade quote_type) and
     `low_similarity` (quote-claim similarity under 0.2: widen the quote, narrow

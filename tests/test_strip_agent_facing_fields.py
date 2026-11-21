@@ -386,7 +386,7 @@ class TestSimilarExistingStripping:
                 f"similarity should be stripped from similar_existing: {entry}"
             )
 
-    def test_action_hint_kept_in_similar_existing(self):
+    def test_severity_and_scent_kept_in_similar_existing(self):
         """action_hint must survive stripping — it encodes the actionable summary."""
         server = fresh_server()
         first_id = _add_obs(server, "Original anchor claim C.",

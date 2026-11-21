@@ -118,6 +118,18 @@ def test_c_lead_names_the_action_for_each_present_lead_severity():
     assert "retract" in lead, lead
 
 
+def test_c_lead_names_the_action_for_a_polarity_alert():
+    # Found by the reviewer-fairy round: emptying the polarity action left every cell green.
+    server = T.fresh_server(polarity_nli=0.60)
+    server._hits = []
+    first = T.add_obs(server, "Topic Z is X.", "https://example.com/pa")["observation_id"]
+    server._hits = [T.hit(server, first, 0.70)]
+    r = T.add_obs(server, "Topic Z is NOT X.", "https://example.com/pb")
+    lead = r["similar_existing_lead"]
+    assert "polarity alert" in lead and first in lead
+    assert "contradict" in lead, lead
+
+
 def _only(server, severity_ids, claim, url):
     """Reply to a fresh write whose similar block holds only the given ids."""
     keep = [h for h in server._hits if h["id"] in severity_ids]
@@ -151,15 +163,34 @@ def test_d_dedup_guidance_is_absent_from_the_reply():
     assert "dedup_guidance" not in r
 
 
+def _reading_paragraph(doc):
+    start = doc.find("Reading the reply.")
+    end = doc.find("Worked examples", start)
+    assert start != -1 and end != -1, "the description has a 'Reading the reply.' paragraph"
+    return doc[start:end]
+
+
 def test_d_tool_description_carries_the_guidance_once_and_stands_alone():
     server = T.fresh_server()
     doc = server.engram_add_observation.__doc__ or ""
     assert doc.count("similar_existing") >= 1
     assert len(re.findall(r"similarity-graded", doc)) == 1, doc
-    # read away from a reply: no word that points at one
+    # the whole paragraph, read away from a reply: no word that points at one
+    para = _reading_paragraph(doc)
     for deictic in ("this reply", "the reply above", "above", "below"):
-        guidance = doc[doc.find("similarity-graded"):][:600]
-        assert deictic not in guidance, (deictic, guidance)
+        assert deictic not in para, (deictic, para)
+
+
+def test_d_tool_description_states_the_corrected_content():
+    # Found by the reviewer-fairy round: a docstring keeping only the word "similarity-graded"
+    # passed. The paragraph must carry what D5 and the CHANGELOG promise.
+    server = T.fresh_server()
+    para = _reading_paragraph(server.engram_add_observation.__doc__ or "")
+    assert "0.85" in para and "0.92" in para, "both duplicate thresholds"
+    assert "conversation or a" in para and "file" in para, "duplicate also fires for long-running sources"
+    for needle in ("hard_data_unanchored", "low_similarity", "person_mentions", "engram_link_about",
+                   "similar_not_shown", "weak_match"):
+        assert needle in para, needle
 
 
 # ── (e) anchoring_advisory: numbers stay, `flags` names the threshold, ───────
@@ -221,6 +252,34 @@ def test_e_low_similarity_flag_absent_at_or_above_the_threshold(monkeypatch):
         sim["v"] = v
         adv = _advisory_for(server, "attributed_analysis", "words about harbours", "words about harbours")
         assert "low_similarity" not in adv.get("flags", []), (v, adv)
+
+
+# ── (f) what stays in full: keys that say THIS write went wrong (D4) ───────
+def test_f_signals_that_fire_on_the_seeded_write_survive_in_full():
+    _, r, _ = _reply()
+    # both fire here only because of the test doubles / fake URL, and survive by rule
+    assert r.get("embedding_failure"), r.keys()
+    assert r.get("quote_provenance_warning"), r.keys()
+
+
+def test_f_recall_summary_overrun_survives():
+    server = T.fresh_server()
+    payload = {"url": "https://example.com/overrun", "title": "T overrun", "quoted_text": "body of text here",
+               "interpretation": "interp", "claim": "A claim about overrun.", "quote_type": "attributed_analysis",
+               "recall_summary": "x" * 150}
+    r = json.loads(server.engram_add_observation(payload_json=json.dumps(payload)))
+    assert r.get("status") == "created", r
+    assert "150" in r.get("recall_summary_overrun", ""), r.get("recall_summary_overrun")
+
+
+def test_f_person_mention_keeps_id_and_name_and_loses_the_message():
+    server = T.fresh_server()
+    p = json.loads(server.engram_add_person(payload_json=json.dumps({"name": "Valentina", "relation": "colleague"})))
+    assert "error" not in p, p
+    r = T.add_obs(server, "Valentina shared an insight about calibration", "https://example.com/pm")
+    pms = r.get("person_mentions")
+    assert pms and pms[0]["person_name"] == "Valentina" and pms[0]["person_id"].startswith("pn_"), r
+    assert set(pms[0]) == {"person_id", "person_name"}, pms[0]
 
 
 # ── (m) the whole reply, size (written last; the bound is logged above) ──────
