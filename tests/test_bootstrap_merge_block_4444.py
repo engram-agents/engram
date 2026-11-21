@@ -400,7 +400,7 @@ def test_C3_help_says_that_force_with_merge_never_discards_text_outside_the_bloc
 
 def test_B9b_help_says_the_refusal_prints_lines_of_the_users_own_file(tmp_path):
     """B9(b) disclosure: `--help` says in one sentence that a refusal prints lines of the user's own
-    file (Zephyr 34061: output can be redirected to a log). Without it nobody knows what a log may hold."""
+    file (the output can be redirected to a log). Without it nobody knows what a log may hold."""
     h = _help_text(tmp_path)
     assert FLAG in h and OWN_TEXT_RE.search(h), h
 
@@ -1151,7 +1151,7 @@ def test_E9_a_differently_cased_user_file_keeps_its_name_and_receives_the_merge(
 
 def test_G_regression_install_sh_is_not_changed_by_this_work(tmp_path):
     """G regression guard (green on dev): `install.sh` still asks its one question and passes
-    `--replace "$CLAUDE_MD"`; it does not pass `--merge` (Ariadne 34038: `--yes` keeps meaning replace)."""
+    `--replace "$CLAUDE_MD"`; it does not pass `--merge` (`--yes` keeps meaning replace)."""
     sh = INSTALL_SH.read_text(encoding="utf-8")
     code = "\n".join(ln for ln in sh.splitlines() if not ln.lstrip().startswith("#"))
     assert "--merge" not in code and "--overwrite-edited-block" not in code

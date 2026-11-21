@@ -45,7 +45,7 @@ R_NEW = R_OLD + "\n## Added\n\nThree more lines here.\n"
 ADDED_LINES = 4
 
 # The B9(b) first line says it prints lines of the user's own file. The contract gives the idea,
-# not the words (Zephyr 34061), so this one regex is the single place a wording choice is encoded.
+# not the words, so this one regex is the single place a wording choice is encoded.
 OWN_TEXT_RE = re.compile(r"(your|user'?s?) own", re.I)
 FLAG = "--overwrite-edited-block"
 
