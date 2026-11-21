@@ -13,8 +13,8 @@ Contract-first: written before `fg.Item.new_text_fn` and `engram_claude_block` e
   * ORDER: apply re-plans FIRST and backs up AFTER, so a raise in the re-plan leaves nothing written by
     apply (a backup that bootstrap took from the first pass stays: copies only).
   * B11 lives inside merge(), so new_text_fn runs it on the bytes of apply's re-plan.
-  * The same forced-order cell against the CURRENT Codex item is a MEASUREMENT for issue 4939
-    (`test_measure_codex_item_stale_text_4939`), not a contract of #4444.
+  * The same forced-order cell against the Codex config.toml item (issue 4939): the item bootstrap builds
+    carries a new_text_fn too (`test_codex_config_item_keeps_an_edit_made_after_the_check_only_pass_4939`).
 
 While `new_text_fn` or the module is missing, a cell fails with a plain AssertionError naming stage 2.
 """
@@ -300,8 +300,11 @@ def test_B8_regression_an_item_without_new_text_fn_keeps_the_fixed_text_behaviou
     assert [b.read_bytes() for b in _stamped(tmp_path)] == [b"old\nedited after the check\n"]
 
 
-# --------------------------------------------------------------------- MEASUREMENT for issue 4939
+# ---------------------------------------------------------------- the Codex config.toml item (issue 4939)
 
+# The probe builds the Codex config.toml item with bootstrap's OWN `_write_items` (the item a real run
+# plans), runs the check-only pass, edits the file, then applies. A replica of the item would not see a fix
+# in bootstrap.py.
 _CODEX_PROBE = r"""
 import json, sys
 from pathlib import Path
@@ -309,15 +312,10 @@ sys.path.insert(0, sys.argv[1])
 import bootstrap
 fg = bootstrap.fg
 cfg = Path(sys.argv[2])
-subs = bootstrap._build_substitutions(dict(bootstrap._FIXED_SEED_IDS), quiet=True)
-_compact, instructions_body = bootstrap._codex_texts(subs)
-compact_path = bootstrap.ENGRAM_HOME / "codex-compact-prompt.md"
-# the Codex item exactly as bootstrap._write_items builds it
-item = fg.Item(
-    cfg,
-    bootstrap.merged_codex_config_text(bootstrap._read_existing_text(cfg), instructions_body, str(compact_path)),
-    first_identity=True,
-)
+ids = dict(bootstrap._FIXED_SEED_IDS)
+subs = bootstrap._build_substitutions(ids, quiet=True)
+items = bootstrap._write_items(ids, subs, "{}", None, bootstrap._predicted_agents_render())
+item = next(it for it in items if it.path == cfg)
 plan = fg.plan([item])                                   # the check-only pass
 edit = b'\n[plugins.added_after_the_check]\nuser_edit = true\n'   # OUTSIDE ENGRAM's identity keys
 cfg.write_bytes(cfg.read_bytes() + edit)
@@ -326,32 +324,21 @@ try:
     fg.apply(plan, fg.consent_for(False, [str(cfg)]))
 except BaseException as e:  # noqa: BLE001
     raised = repr(e)
-final = cfg.read_bytes()
-print(json.dumps({"survived": b"user_edit = true" in final, "raised": raised,
-                  "final_head": final[:200].decode("utf-8", "replace"),
-                  "final_tail": final[-200:].decode("utf-8", "replace"),
+final = cfg.read_bytes().decode("utf-8")
+print(json.dumps({"raised": raised, "final": final, "final_head": final[:120], "final_tail": final[-200:],
                   "backups": sorted(p.name for p in cfg.parent.iterdir() if p.name != cfg.name)}))
 """
 
+FOREIGN_STANZA = '[plugins.someone]\nkey = "value"\n'
+ADDED_STANZA = "[plugins.added_after_the_check]\nuser_edit = true\n"
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,  # only the lost-update assertion below raises it; a broken probe raises RuntimeError and goes red
-    reason="issue 4939: the Codex config.toml item still passes a fixed text computed before apply, so an edit "
-           "made after the check-only pass is lost; remove this marker when the Codex item moves to new_text_fn",
-)
-def test_measure_codex_item_stale_text_4939(tmp_path):
-    """MEASUREMENT for issue 4939 (NOT a contract of #4444). The CURRENT Codex `config.toml` item is
-    built the way bootstrap builds it (`merged_codex_config_text(_read_existing_text(config_path), ...)`),
-    planned, the user's file is edited OUTSIDE ENGRAM's region, then apply runs. GREEN = the edit
-    survived; RED = apply wrote the text it computed from the OLD bytes and the edit was lost (a stale-text
-    lost update). The cell asserts survival so its colour is the measurement; the final bytes are in the
-    failure message and in the handoff."""
+
+def _codex_probe(tmp_path: Path) -> dict:
     engram_home = tmp_path / ".engram"
     engram_home.mkdir()
     cfg = tmp_path / ".codex" / "config.toml"
     cfg.parent.mkdir()
-    cfg.write_text('[plugins.someone]\nkey = "value"\n', encoding="utf-8")
+    cfg.write_text(FOREIGN_STANZA, encoding="utf-8")
     env = os.environ.copy()
     env.update({
         "HOME": str(tmp_path), "ALPHA_DIR": str(REPO_ROOT), "ALPHA_TEMPLATES_DIR": str(SRC / "templates"),
@@ -361,15 +348,167 @@ def test_measure_codex_item_stale_text_4939(tmp_path):
     })
     r = subprocess.run([sys.executable, "-c", _CODEX_PROBE, str(SRC), str(cfg)],
                        env=env, capture_output=True, text=True, timeout=120)
-    if r.returncode != 0:  # a broken probe is not the measurement: RuntimeError is not the xfail's `raises`
-        raise RuntimeError("the 4939 probe itself failed:\n" + r.stdout + r.stderr)
-    result = json.loads(r.stdout.strip().splitlines()[-1])
-    assert result["survived"], (
-        "MEASUREMENT (4939): the user's edit (the `[plugins.added_after_the_check]` stanza with "
-        "`user_edit = true`, appended after the check-only pass) was LOST by apply; "
-        f"raised={result['raised']}; backups={result['backups']}; final head={result['final_head']!r}; "
-        f"final tail={result['final_tail']!r}"
+    if r.returncode != 0:  # a broken probe is not the contract's observable
+        raise RuntimeError("the Codex probe itself failed:\n" + r.stdout + r.stderr)
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def test_codex_config_item_keeps_an_edit_made_after_the_check_only_pass_4939(tmp_path):
+    """Issue 4939: an edit made to the Codex config.toml between the check-only pass and apply is present in
+    the final bytes, and the foreign stanza that was in the file before the check is still there. If the item
+    carried a fixed text computed before apply, apply would write that stale text and the added stanza would
+    be gone (a lost update). The item is the one bootstrap builds, not a copy."""
+    result = _codex_probe(tmp_path)
+    final = result["final"]
+    assert result["raised"] is None, result["raised"]
+    assert ADDED_STANZA in final, (
+        "the user's edit (the `[plugins.added_after_the_check]` stanza with `user_edit = true`, appended after "
+        f"the check-only pass) was LOST by apply; backups={result['backups']}; final tail={result['final_tail']!r}"
     )
+    assert FOREIGN_STANZA in final, f"the foreign stanza that was there before the check is gone: {final!r}"
+    assert final.count('instructions = """') == 1, "the identity keys must appear exactly once"
+
+
+def test_codex_config_second_run_is_byte_identical_and_takes_no_backup_4939(tmp_path):
+    """Issue 4939 (idempotence): after a normal Codex run, a second run over the result leaves config.toml's
+    bytes and modification time alone and creates no backup. The older Codex cells count the identity keys
+    and the backups (test_bootstrap_codex, the 4440 file) but never compare the bytes; a new_text_fn whose text
+    differed from what the first run wrote in even one character would make the second run take a backup and
+    rewrite."""
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text(FOREIGN_STANZA, encoding="utf-8")
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(tmp_path), "ALPHA_DIR": str(REPO_ROOT), "ALPHA_TEMPLATES_DIR": str(SRC / "templates"),
+        "ENGRAM_HOME": str(tmp_path / ".engram"), "CLAUDE_HOME": str(tmp_path / ".claude"),
+        "CODEX_HOME": str(tmp_path / ".codex"), "TARGET": "codex", "PYTHON_BIN": sys.executable,
+        "ENGRAM_NO_EMBEDDINGS": "1",
+    })
+
+    def run(*args):
+        (tmp_path / ".engram").mkdir(exist_ok=True)
+        r = subprocess.run([sys.executable, str(SRC / "bootstrap.py"), *args], env=env, capture_output=True,
+                           text=True, timeout=120)
+        assert r.returncode == 0, r.stdout + r.stderr
+
+    run("--force")
+    first = cfg.read_bytes()
+    os.utime(cfg, (1_000_000_000, 1_000_000_000))
+    names = _names(cfg.parent)
+    import shutil
+    shutil.rmtree(tmp_path / ".engram")
+    run()
+    assert cfg.read_bytes() == first and FOREIGN_STANZA in first.decode("utf-8")
+    assert cfg.stat().st_mtime_ns == 1_000_000_000 * 10**9, "the second run rewrote config.toml"
+    assert _names(cfg.parent) == names, "the second run took a backup"
+
+
+def test_codex_config_converted_to_crlf_comes_out_as_the_clean_lf_render_and_stays_put_4939(tmp_path):
+    """Issue 4939 (line endings): a config.toml converted to CRLF throughout (an editor did it), with ENGRAM's
+    identity block and one foreign stanza, is rewritten to exactly the LF render the first run wrote, the
+    foreign stanza kept, and a second run changes nothing (bytes, mtime, backups). The old read translated
+    CRLF and lone CR to LF before merging; a new_text_fn that merged the raw CRLF text would leave stray blank
+    CRLF lines where the old identity lines were stripped."""
+    import shutil
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text(FOREIGN_STANZA, encoding="utf-8")
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(tmp_path), "ALPHA_DIR": str(REPO_ROOT), "ALPHA_TEMPLATES_DIR": str(SRC / "templates"),
+        "ENGRAM_HOME": str(tmp_path / ".engram"), "CLAUDE_HOME": str(tmp_path / ".claude"),
+        "CODEX_HOME": str(tmp_path / ".codex"), "TARGET": "codex", "PYTHON_BIN": sys.executable,
+        "ENGRAM_NO_EMBEDDINGS": "1",
+    })
+
+    def run(*args):
+        shutil.rmtree(tmp_path / ".engram", ignore_errors=True)
+        (tmp_path / ".engram").mkdir()
+        r = subprocess.run([sys.executable, str(SRC / "bootstrap.py"), *args], env=env, capture_output=True,
+                           text=True, timeout=120)
+        assert r.returncode == 0, r.stdout + r.stderr
+
+    run("--force")
+    lf_render = cfg.read_bytes()
+    assert b"\r" not in lf_render and FOREIGN_STANZA.encode() in lf_render
+    cfg.write_bytes(lf_render.replace(b"\n", b"\r\n"))  # the whole file, identity block and stanza, as CRLF
+    run("--force")
+    assert cfg.read_bytes() == lf_render, "the CRLF file did not come out as the clean LF render"
+    os.utime(cfg, (1_000_000_000, 1_000_000_000))
+    names = _names(cfg.parent)
+    run()
+    assert cfg.read_bytes() == lf_render
+    assert cfg.stat().st_mtime_ns == 1_000_000_000 * 10**9, "the second run rewrote config.toml"
+    assert _names(cfg.parent) == names, "the second run took a backup"
+
+
+def _codex_converted_roundtrip(tmp_path: Path, convert) -> None:
+    """First run (--force) writes the LF render; `convert(lf_bytes)` rewrites the whole file with other line
+    endings; a second --force run must give back exactly the LF render with the foreign stanza kept; a third run
+    with no flag leaves bytes, mtime and the directory listing alone."""
+    import shutil
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text(FOREIGN_STANZA, encoding="utf-8")
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(tmp_path), "ALPHA_DIR": str(REPO_ROOT), "ALPHA_TEMPLATES_DIR": str(SRC / "templates"),
+        "ENGRAM_HOME": str(tmp_path / ".engram"), "CLAUDE_HOME": str(tmp_path / ".claude"),
+        "CODEX_HOME": str(tmp_path / ".codex"), "TARGET": "codex", "PYTHON_BIN": sys.executable,
+        "ENGRAM_NO_EMBEDDINGS": "1",
+    })
+
+    def run(*args):
+        shutil.rmtree(tmp_path / ".engram", ignore_errors=True)
+        (tmp_path / ".engram").mkdir()
+        r = subprocess.run([sys.executable, str(SRC / "bootstrap.py"), *args], env=env, capture_output=True,
+                           text=True, timeout=120)
+        assert r.returncode == 0, r.stdout + r.stderr
+
+    run("--force")
+    lf_render = cfg.read_bytes()
+    assert b"\r" not in lf_render and FOREIGN_STANZA.encode() in lf_render
+    converted = convert(lf_render)
+    assert converted != lf_render
+    cfg.write_bytes(converted)
+    run("--force")
+    assert cfg.read_bytes() == lf_render, "the converted file did not come out as the clean LF render"
+    assert FOREIGN_STANZA.encode() in cfg.read_bytes()
+    os.utime(cfg, (1_000_000_000, 1_000_000_000))
+    names = _names(cfg.parent)
+    run()
+    assert cfg.read_bytes() == lf_render
+    assert cfg.stat().st_mtime_ns == 1_000_000_000 * 10**9, "the second run rewrote config.toml"
+    assert _names(cfg.parent) == names, "the second run took a backup"
+
+
+def test_codex_config_converted_to_lone_cr_comes_out_as_the_clean_lf_render_4939(tmp_path):
+    """Issue 4939 (line endings, lone CR): a config.toml whose every line ending was turned into a lone CR (an old
+    Mac-style conversion) comes out as exactly the LF render, the foreign stanza kept, and a second run changes
+    nothing. The old universal-newline read turned a lone CR into LF; a new_text_fn that only handled CRLF would
+    see one long line and merge into it, which the CRLF cell cannot notice."""
+    _codex_converted_roundtrip(tmp_path, lambda lf: lf.replace(b"\n", b"\r"))
+
+
+def test_codex_config_with_mixed_line_endings_comes_out_as_the_clean_lf_render_4939(tmp_path):
+    """Issue 4939 (line endings, mixed): the line endings cycle line by line through CRLF, a lone CR and LF, so all
+    three kinds sit in ENGRAM's identity block (the cycle is phased so the foreign stanza's last line ends in CRLF). The result is
+    exactly the LF render with the stanza kept, and a second run changes nothing. Handling only one of the two
+    replacements leaves some of the endings in place and the text differs."""
+    kinds = [b"\r\n", b"\r", b"\n"]
+
+    def mix(lf: bytes) -> bytes:
+        parts = lf.split(b"\n")
+        # phase the cycle so the LAST line (the foreign stanza's) ends in CRLF: a CRLF replacement that is
+        # dropped then leaves an extra blank line at the end of the file
+        phase = -(len(parts) - 2) % 3
+        out = bytearray()
+        for i, part in enumerate(parts[:-1]):
+            out += part + kinds[(i + phase) % 3]
+        return bytes(out) + parts[-1]
+
+    _codex_converted_roundtrip(tmp_path, mix)
 
 
 def test_B8_an_unreadable_file_with_a_new_text_fn_is_a_one_line_refusal_not_an_escaping_error(tmp_path):

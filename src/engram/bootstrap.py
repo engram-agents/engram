@@ -800,12 +800,20 @@ def _write_items(
         compact_path = ENGRAM_HOME / "codex-compact-prompt.md"
         config_path = CODEX_HOME / "config.toml"
         items.append(fg.Item(compact_path, compact_text))
+        # #4939: the merged text is a function of the bytes the guard reads at write time (new_text_fn), so an
+        # edit made after the check-only pass is merged, not overwritten. The first positional text stays the
+        # PREDICTED text, computed here from what is on disk now (it also keeps the "not UTF-8 text" refusal).
         items.append(fg.Item(
             config_path,
             merged_codex_config_text(
                 _read_existing_text(config_path), instructions_body, str(compact_path)
             ),
             first_identity=True,
+            # CRLF and a lone CR read as LF, as the old universal-newline read did, so a config an editor
+            # converted to CRLF comes out as the same clean render (merged_codex_config_text is line-based).
+            new_text_fn=lambda current: merged_codex_config_text(
+                current.replace("\r\n", "\n").replace("\r", "\n"), instructions_body, str(compact_path)
+            ),
         ))
         items.append(fg.Item(CODEX_HOME / "AGENTS.md", agents_md_text, first_identity=True))
     return items
