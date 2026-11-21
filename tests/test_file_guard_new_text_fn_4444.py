@@ -443,6 +443,74 @@ def test_codex_config_converted_to_crlf_comes_out_as_the_clean_lf_render_and_sta
     assert _names(cfg.parent) == names, "the second run took a backup"
 
 
+def _codex_converted_roundtrip(tmp_path: Path, convert) -> None:
+    """First run (--force) writes the LF render; `convert(lf_bytes)` rewrites the whole file with other line
+    endings; a second --force run must give back exactly the LF render with the foreign stanza kept; a third run
+    with no flag leaves bytes, mtime and the directory listing alone."""
+    import shutil
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text(FOREIGN_STANZA, encoding="utf-8")
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(tmp_path), "ALPHA_DIR": str(REPO_ROOT), "ALPHA_TEMPLATES_DIR": str(SRC / "templates"),
+        "ENGRAM_HOME": str(tmp_path / ".engram"), "CLAUDE_HOME": str(tmp_path / ".claude"),
+        "CODEX_HOME": str(tmp_path / ".codex"), "TARGET": "codex", "PYTHON_BIN": sys.executable,
+        "ENGRAM_NO_EMBEDDINGS": "1",
+    })
+
+    def run(*args):
+        shutil.rmtree(tmp_path / ".engram", ignore_errors=True)
+        (tmp_path / ".engram").mkdir()
+        r = subprocess.run([sys.executable, str(SRC / "bootstrap.py"), *args], env=env, capture_output=True,
+                           text=True, timeout=120)
+        assert r.returncode == 0, r.stdout + r.stderr
+
+    run("--force")
+    lf_render = cfg.read_bytes()
+    assert b"\r" not in lf_render and FOREIGN_STANZA.encode() in lf_render
+    converted = convert(lf_render)
+    assert converted != lf_render
+    cfg.write_bytes(converted)
+    run("--force")
+    assert cfg.read_bytes() == lf_render, "the converted file did not come out as the clean LF render"
+    assert FOREIGN_STANZA.encode() in cfg.read_bytes()
+    os.utime(cfg, (1_000_000_000, 1_000_000_000))
+    names = _names(cfg.parent)
+    run()
+    assert cfg.read_bytes() == lf_render
+    assert cfg.stat().st_mtime_ns == 1_000_000_000 * 10**9, "the second run rewrote config.toml"
+    assert _names(cfg.parent) == names, "the second run took a backup"
+
+
+def test_codex_config_converted_to_lone_cr_comes_out_as_the_clean_lf_render_4939(tmp_path):
+    """Issue 4939 (line endings, lone CR): a config.toml whose every line ending was turned into a lone CR (an old
+    Mac-style conversion) comes out as exactly the LF render, the foreign stanza kept, and a second run changes
+    nothing. The old universal-newline read turned a lone CR into LF; a new_text_fn that only handled CRLF would
+    see one long line and merge into it, which the CRLF cell cannot notice."""
+    _codex_converted_roundtrip(tmp_path, lambda lf: lf.replace(b"\n", b"\r"))
+
+
+def test_codex_config_with_mixed_line_endings_comes_out_as_the_clean_lf_render_4939(tmp_path):
+    """Issue 4939 (line endings, mixed): the line endings cycle line by line through CRLF, a lone CR and LF, so all
+    three kinds sit in ENGRAM's identity block (the cycle is phased so the foreign stanza's last line ends in CRLF). The result is
+    exactly the LF render with the stanza kept, and a second run changes nothing. Handling only one of the two
+    replacements leaves some of the endings in place and the text differs."""
+    kinds = [b"\r\n", b"\r", b"\n"]
+
+    def mix(lf: bytes) -> bytes:
+        parts = lf.split(b"\n")
+        # phase the cycle so the LAST line (the foreign stanza's) ends in CRLF: a CRLF replacement that is
+        # dropped then leaves an extra blank line at the end of the file
+        phase = -(len(parts) - 2) % 3
+        out = bytearray()
+        for i, part in enumerate(parts[:-1]):
+            out += part + kinds[(i + phase) % 3]
+        return bytes(out) + parts[-1]
+
+    _codex_converted_roundtrip(tmp_path, mix)
+
+
 def test_B8_an_unreadable_file_with_a_new_text_fn_is_a_one_line_refusal_not_an_escaping_error(tmp_path):
     """B8 / plan(): a file the guard cannot read (mode 000) must not let an OSError out of the check-only
     pass. The entry is refused with ONE REFUSED line naming the file, nothing is written. Without the catch
