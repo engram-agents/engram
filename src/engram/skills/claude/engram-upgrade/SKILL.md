@@ -354,6 +354,8 @@ If Step 2 found the CLAUDE.md render source (`templates/template.CLAUDE.md`) cha
 
 **The "I'll come back to it" failure mode is real** (2026-05-16: a template discipline-change was deferred post-deploy, never merged, and misfired for days before diagnosis). Resolve it now or track it explicitly — never silent-defer.
 
+**Wrapped files.** A live CLAUDE.md written by `bootstrap.py --merge` carries ENGRAM's block between `<!-- engram:begin sha256=... -->` and `<!-- engram:end -->`; compare the inside of the block only, never the user's own text around it. A file with no markers is compared as a whole file, as before.
+
 **Profiles.** The gate compares your file against the template of the profile your home **recorded** in `config.json` (`claude_md_profile`; no record means full), and never renders or offers the other profile: do not suggest a switch here. A recorded value the upgrade does not know means nothing was compared: ask the user which profile their file follows. The drift tool below reads that record (pass `--engram-home`) and diffs the recorded profile's template only; an unrecognised value makes it exit 2 and print "undetermined" without comparing, so ask the user.
 
 Use the rendered-diff tool (catches changes to ALL render sources, not just the main template):

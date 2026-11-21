@@ -477,7 +477,7 @@ def test_the_owned_list_is_closed_a_caller_cannot_widen_it(tmp_path):
     p = fg.plan([fg.Item(f, "new", owned=True)], STAMP, home=tmp_path)
     assert p.entries[0].state == "differs", "owned=True is honoured only for the names on the closed list"
     assert fg.refusal(p) is not None
-    assert fg.ENGRAM_OWNED_NAMES == ("first-run-pending", "seed-manifest.json")
+    assert fg.ENGRAM_OWNED_NAMES == ("first-run-pending", "seed-manifest.json", "claude-md-block.json")
 
 
 def test_a_leftover_first_run_pending_alone_does_not_block_bootstrap(tmp_path):

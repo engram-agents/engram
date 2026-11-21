@@ -285,6 +285,11 @@
       "note": "The one place that decides, backs up and writes a protected file during setup (plan / refusal / apply; stamped backup, exclusive copy, atomic write). Stdlib-only. Essential because bootstrap.py imports it at module level (a hard dependency): without it setup cannot run, and a copy that silently went missing must not fall back to writing without the guard."
     },
     {
+      "path": "engram_claude_block.py",
+      "tier": "essential",
+      "note": "engram-alpha#4444: the ENGRAM block in CLAUDE.md (marker constants, wrap, merge, unwrap, plan_removal). Pure and stdlib-only. Essential because bootstrap.py imports it at module level (a hard dependency, like the file guard), engram_file_guard.py imports it lazily (inside _refusal_types) to recognise its MergeRefused, and the uninstaller removes the block through it."
+    },
+    {
       "path": "engram_home_registry.py",
       "tier": "convenience",
       "note": "Per-seat ENGRAM home registry (#3863 PR 5, ruling R3): the SessionStart hook records a non-default home, viz discovery and the viz-operator ACL tool read it before their glob. Stdlib-only. Every importer is fail-soft (hook swallows, viz and the ACL tool fall back to the glob), so a missing copy degrades to today's behaviour."

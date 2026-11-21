@@ -208,6 +208,9 @@ restore_identity_file() {
     fi
     cp -p "$file" "$saved" || die "could not save $file to $saved; $file left untouched"
     log "Saved your current $file to $saved"
+    if [[ "$file" == "$CLAUDE_HOME/CLAUDE.md" && $REPLACED_NOTE -eq 1 ]]; then
+      log "the file you are replacing held text that did not match this install's text; it is in $saved"
+    fi
   elif [[ $DRY_RUN -eq 1 ]]; then
     log "(dry-run) Would restore $backup to $file"
     return 0
@@ -216,13 +219,96 @@ restore_identity_file() {
   log "Restored $backup to $file (the backup is kept)."
 }
 
+
+# ── ENGRAM block removal (#4444) ─────────────────────────────────────────────────
+# A CLAUDE.md written by `bootstrap.py --merge` holds ENGRAM's text between two markers, with the user's own
+# text around it. Removing the block goes through the SAME Python module the installer uses (D5), through the
+# venv python, and BEFORE any --purge-venv step (uninstall_files runs after this). Never a shell fallback: if
+# that python is missing or fails, the file is left untouched and one line says why. The block is removed
+# only when THIS ENGRAM home's record names this file and the hash in the BEGIN line (D6); a file with no
+# marker at all keeps the #4440 rule (save, then restore .pre-engram).
+# The strings below are the module's constants, spelled out only to find a file worth asking python about;
+# tests/test_claude_block_uninstall_4444.py pins that they equal engram_claude_block.BEGIN_PREFIX / END_LINE.
+BLOCK_BEGIN_PREFIX='<!-- engram:begin sha256='
+BLOCK_END_LINE='<!-- engram:end -->'
+BLOCK_HANDLED=0         # 1 = the block step dealt with CLAUDE.md (removed the block, or left it): no restore
+REPLACED_NOTE=0         # 1 = the restore will replace text that is not this install's wrapped render (D3c)
+uninstall_claude_block() {
+  [[ "$TARGET" == "codex" ]] && return 0
+  local file="$CLAUDE_HOME/CLAUDE.md" py="$HOME/.engram/venv/bin/python3" tmp rc=0 reason stamp saved
+  [[ -f "$file" && ! -L "$file" ]] || return 0
+  if ! grep -qF -e "$BLOCK_BEGIN_PREFIX" -e "$BLOCK_END_LINE" "$file" 2>/dev/null; then
+    REPLACED_NOTE=1     # no marker: it can never equal the wrapped render this install writes
+    return 0
+  fi
+  BLOCK_HANDLED=1
+  if [[ ! -x "$py" ]]; then
+    warn "$file left untouched: its ENGRAM block cannot be removed because the venv python ($py) is missing."
+    return 0
+  fi
+  tmp="$(mktemp)" || { warn "$file left untouched: no temporary file could be made."; return 0; }
+  "$py" - "$file" "$tmp" "$SCRIPT_DIR/.." "$ENGRAM_HOME/claude-md-block.json" >"$tmp.msg" 2>&1 <<'PYEOF' || rc=$?
+import json, os, sys
+file, out, root, record = sys.argv[1:5]
+sys.path.insert(0, root)
+import engram_claude_block as b
+try:
+    text = open(file, "rb").read().decode("utf-8")
+except (OSError, UnicodeDecodeError):
+    print("it cannot be read as UTF-8 text")
+    sys.exit(2)
+try:
+    rec = json.load(open(record, encoding="utf-8"))
+except (OSError, ValueError):
+    rec = None
+action, detail = b.plan_removal(text, os.path.realpath(file), rec if isinstance(rec, dict) else None)
+if action == "leave":
+    print(detail)
+    sys.exit(2)
+if action == "pure":
+    sys.exit(10)
+if action == "pure_other":
+    sys.exit(12)
+if action == "none":
+    sys.exit(11)
+open(out, "wb").write(detail.encode("utf-8"))
+PYEOF
+  case $rc in
+    0) ;;
+    10|11|12)
+      BLOCK_HANDLED=0                      # nothing for the block step to do: today's rule restores the backup
+      [[ $rc -eq 10 ]] && REPLACED_NOTE=0 || REPLACED_NOTE=1
+      rm -f "$tmp" "$tmp.msg"; return 0 ;;
+    2)
+      reason="$(head -n 1 "$tmp.msg")"
+      warn "$file left untouched: $reason."
+      rm -f "$tmp" "$tmp.msg"; return 0 ;;
+    *)
+      warn "$file left untouched: the venv python ($py) failed, so the ENGRAM block was not removed."
+      rm -f "$tmp" "$tmp.msg"; return 0 ;;
+  esac
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  saved="$file.pre-uninstall.$stamp"
+  if [[ -e "$saved" || -L "$saved" ]]; then
+    warn "$saved already exists — $file left untouched; re-run in a second."
+  elif [[ $DRY_RUN -eq 1 ]]; then
+    log "(dry-run) Would copy $file to $saved, then remove ENGRAM's block from it"
+  else
+    cp -p "$file" "$saved" || die "could not save $file to $saved; $file left untouched"
+    log "Saved your current $file to $saved"
+    cat "$tmp" > "$file" || die "could not rewrite $file (your text is in $saved)"
+    log "Removed ENGRAM's block from $file; your own text is kept."
+  fi
+  rm -f "$tmp" "$tmp.msg"
+}
+
 # The identity files this target restores (Codex has two: config.toml and AGENTS.md, #4452).
 restore_identity_files() {
   if [[ "$TARGET" == "codex" ]]; then
     restore_identity_file "$CODEX_HOME/config.toml"
     restore_identity_file "$CODEX_HOME/AGENTS.md"
   else
-    restore_identity_file "$CLAUDE_HOME/CLAUDE.md"
+    [[ $BLOCK_HANDLED -eq 1 ]] || restore_identity_file "$CLAUDE_HOME/CLAUDE.md"
   fi
 }
 
@@ -945,7 +1031,9 @@ uninstall_services
 if [[ ! -d "$MARKETPLACE_ROOT" && ! -f "$VERSION_MARKER" ]]; then
   log "Nothing to uninstall — marketplace and version marker both absent."
   # A leftover .pre-engram backup must still be restored (the restore has no dependence on
-  # the marketplace tree); with no backup this logs "left untouched" and changes nothing.
+  # the marketplace tree); with no backup this logs "left untouched" and changes nothing. The block
+  # step goes first (#4444 D5): a file with ENGRAM's block must not be restored over.
+  uninstall_claude_block
   restore_identity_files
   if [[ $SKIP_CLI -eq 0 ]]; then
     warn "If the plugin is still registered with Claude Code, run:"
@@ -999,6 +1087,7 @@ fi
 
 # ── 1b. Files and links of this home (#4446 2b). After the CLI remove (B8, B3), before the tree goes
 #        (B15 reads the plugin's agents list from it) ──────────────────────────────────────────────
+uninstall_claude_block
 uninstall_files
 
 # ── 2. Remove marketplace tree ──────────────────────────────────────────────

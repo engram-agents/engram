@@ -189,6 +189,7 @@ _TOOLS_DIR = Path(__file__).resolve().parent          # src/engram/tools/
 _SRC_ENGRAM = _TOOLS_DIR.parent                       # src/engram/
 
 sys.path.insert(0, str(_SRC_ENGRAM))
+import engram_claude_block  # noqa: E402
 from template_render import (  # noqa: E402
     CLAUDE_MD_PROFILE_SOURCES,
     CLAUDE_RENDER_SOURCES,
@@ -557,6 +558,13 @@ def run_live(args: argparse.Namespace, repo: Path) -> int:
                 subs[placeholder] = value
         # {{ENGRAM_HOME}} stays in the text; _check_set tries every home form.
         homes = _home_forms(subs.pop("{{ENGRAM_HOME}}", None))
+        # A live file written by `bootstrap.py --merge` holds ENGRAM's text in a block with the user's own text
+        # around it: only the block's inside is compared (CRLF read as LF); a file with no markers is compared
+        # whole, as before; ambiguous markers cannot be split, so the file is compared whole too (#4444 A1).
+        try:
+            live_text = engram_claude_block.unwrap(live_text)
+        except engram_claude_block.MergeRefused:
+            pass
         live_norm = _norm(live_text)
 
         main_file = CLAUDE_MD_PROFILE_SOURCES[profile][0]

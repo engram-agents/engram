@@ -46,7 +46,7 @@ from typing import Any, Callable, Iterable, NamedTuple
 # Item(owned=True) is honoured only for these names, and only when the file sits directly in the
 # ENGRAM home being set up (the `home` given to plan()). The same name in any other folder is a
 # file like any other.
-ENGRAM_OWNED_NAMES = ("first-run-pending", "seed-manifest.json")
+ENGRAM_OWNED_NAMES = ("first-run-pending", "seed-manifest.json", "claude-md-block.json")
 
 STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 FIRST_BACKUP_SUFFIX = ".pre-engram"
@@ -69,6 +69,11 @@ class Item(NamedTuple):
     new_text: "str | None"
     first_identity: bool = False
     owned: bool = False
+    new_text_fn: "Callable[[str], str] | None" = None
+    # new_text_fn (optional): called with the file's CURRENT text (decoded bytes, line endings intact; "" when
+    # the file is absent) and returns the text to write. plan() and apply()'s re-plan both call it, so the text
+    # is a function of the bytes read at write time, not of a value computed earlier (#4444 B8). It may raise
+    # MergeRefused: the entry then has state "merge_refused" and refusal() turns it into ONE REFUSED message.
     # owned=True: ENGRAM's own bookkeeping file (see ENGRAM_OWNED_NAMES). It is rewritten when
     # it differs, with no consent and no backup; it is never something the user or their agent wrote.
 
@@ -82,6 +87,7 @@ class Entry(NamedTuple):
     first_identity: bool = False
     owned: bool = False
     note: str = ""       # unreadable: the error that stopped the same-file check
+    new_text_fn: "Callable[[str], str] | None" = None
 
 
 class Plan(NamedTuple):
@@ -192,7 +198,7 @@ def classify(path: Path, new_text: "str | None") -> str:
         return "blocked"
     if new_text is not None:
         try:
-            if path.read_text(encoding="utf-8") == new_text:  # utf-8 like the writes, never the locale's
+            if path.read_bytes().decode("utf-8") == new_text:  # utf-8 like the writes, never the locale's
                 return "identical"
         except (OSError, UnicodeDecodeError):
             pass
@@ -226,6 +232,16 @@ def _is_directly_in(path: Path, home: "Path | None") -> bool:
     return os.path.dirname(_key(path)) == os.path.realpath(os.path.abspath(os.path.expanduser(str(home))))
 
 
+def _refusal_types() -> "tuple[type, ...]":
+    """What a new_text_fn may raise to say 'this file must not be changed': this module's MergeRefused and the
+    one in engram_claude_block (a separate pure module; imported here only when it is present)."""
+    try:
+        import engram_claude_block
+    except ImportError:
+        return (MergeRefused,)
+    return (MergeRefused, engram_claude_block.MergeRefused)
+
+
 def plan(items: Iterable[Item], stamp: "str | None" = None, home: "Path | None" = None) -> Plan:
     """Check-only pass. Writes nothing and raises nothing.
 
@@ -235,8 +251,22 @@ def plan(items: Iterable[Item], stamp: "str | None" = None, home: "Path | None" 
     stamp = stamp or utc_stamp()
     entries = []
     for it in items:
-        state = classify(it.path, it.new_text)
         note = ""
+        new_text = it.new_text
+        merge_state = None
+        if it.new_text_fn is not None:
+            try:
+                cur = ""
+                if target_present(it.path) and it.path.is_file():
+                    cur = it.path.read_bytes().decode("utf-8")
+                new_text = it.new_text_fn(cur)
+            except UnicodeDecodeError as e:
+                merge_state, note = "merge_refused", f"cannot read as UTF-8 text ({e}), so ENGRAM cannot merge into it. Move it aside, then re-run."
+            except OSError as e:  # a file that cannot be read (mode 000): refused in one line, never a traceback
+                merge_state, note = "merge_refused", f"cannot read it ({e}), so ENGRAM cannot merge into it. Fix its permissions or move it aside, then re-run."
+            except _refusal_types() as e:
+                merge_state, note = "merge_refused", str(e)
+        state = merge_state or classify(it.path, new_text)
         if state == "differs" and it.first_identity:
             verdict, err = same_file(it.path, _pre_engram(it.path))
             if verdict == SAME:
@@ -247,7 +277,7 @@ def plan(items: Iterable[Item], stamp: "str | None" = None, home: "Path | None" 
             state = "owned"
         backup = _next_backup_name(it.path, stamp) if state == "differs" else None
         first = _first_backup_name(it.path, it.first_identity) if state == "differs" else None
-        entries.append(Entry(it.path, it.new_text, state, backup, first, it.first_identity, it.owned, note))
+        entries.append(Entry(it.path, new_text, state, backup, first, it.first_identity, it.owned, note, it.new_text_fn))
     return Plan(tuple(entries), stamp, home)
 
 
@@ -261,6 +291,10 @@ def refusal(p: Plan, consent: Consent = NO_CONSENT, context: str = "") -> "str |
     Every path is printed in one canonical form (parent directory resolved, name as written),
     the same form `--replace PATH` is compared in.
     """
+    mr = [e for e in p.entries if e.state == "merge_refused"]
+    if mr:
+        e = mr[0]
+        return f"[bootstrap] REFUSED: {_canon(e.path)}: {e.note}"
     need = [e for e in p.entries if e.state == "differs" and not consent.allows(e.path)]
     stuck = [e for e in p.entries if e.state in ("dangling", "blocked", "obstructed", "unreadable")]
     if not need and not stuck:
@@ -281,7 +315,10 @@ def refusal(p: Plan, consent: Consent = NO_CONSENT, context: str = "") -> "str |
             "Backups accumulate: every replace adds one, and nothing deletes them automatically. "
             "Show the user this list and get their yes first. Then re-run with "
             "--replace PATH (repeat it for each path they agreed to) or --force (every path "
-            "listed). Or leave a file as it is: move it aside yourself, then re-run."
+            "listed). "
+            + ("For CLAUDE.md, --merge keeps your own text and replaces only ENGRAM's block. "
+               if any(e.path.name == "CLAUDE.md" for e in need) else "")
+            + "Or leave a file as it is: move it aside yourself, then re-run."
         )
     for e in stuck:
         where = _canon(e.path)
@@ -698,7 +735,7 @@ def apply(p: Plan, consent: Consent = NO_CONSENT, context: str = "",
     in ENGRAM_OWNED_NAMES that differs is rewritten with no consent and no backup.
     """
     saved = saved or {}
-    fresh = plan([Item(e.path, e.new_text, e.first_identity, e.owned) for e in p.entries], p.stamp, p.home)
+    fresh = plan([Item(e.path, e.new_text, e.first_identity, e.owned, e.new_text_fn) for e in p.entries], p.stamp, p.home)
     for e in fresh.entries:
         if e.new_text is not None:
             e.new_text.encode("utf-8")  # UnicodeEncodeError here: nothing backed up, nothing written
