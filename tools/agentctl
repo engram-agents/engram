@@ -138,8 +138,8 @@ readonly EXIT_ACTION_UNLOGGED=8
 readonly AGENTCTL_TOOL="/usr/local/bin/agentctl"
 
 # Viz/operator account that needs read access to agent ~/.engram dirs for the
-# viz dashboard (knowledge.db dropdown) and write access to config.json for
-# the viz config tab.
+# viz dashboard (knowledge.db dropdown) and read-only access to config.json
+# (#341: the operator never gets write).
 #
 # NO DEFAULT (engram-alpha#2720, Lei's ruling): a hardcoded local account name
 # ("spt") in shipped code was a functional leak of one host's personal setting
@@ -331,7 +331,7 @@ _require_viz_operator() {
     echo "ERROR: VIZ_OPERATOR is not set." >&2
     echo "       VIZ_OPERATOR names the human operator account that runs the" >&2
     echo "       viz dashboard and needs read-only access to every seat's" >&2
-    echo "       ENGRAM data (health snapshots, knowledge.db) plus read-write" >&2
+    echo "       ENGRAM data (health snapshots, knowledge.db) plus read-only" >&2
     echo "       on each seat's config.json. '$caller' will not proceed" >&2
     echo "       without it — there is no default." >&2
     echo "" >&2
@@ -3011,8 +3011,9 @@ JSON
     # Step 7: grant viz/operator (spt) ACLs on ~/.engram* so the agent is
     # viz-visible by default without a manual setfacl step (#1108).
     # Grants: rX (read+traverse) on all ~/.engram* dirs so the viz dashboard
-    # can read knowledge.db; rw on config.json so the viz config tab can edit
-    # it. Uses the per-config-ACL model: config-write via POSIX ACL.
+    # can read knowledge.db; r on config.json (read-only, #341: the operator
+    # never gets write; the dashboard's config-write path is a separate
+    # decision, not an installer grant). Uses the per-config-ACL model.
     # Handles ~/.engram-<lineage> variants (e.g. .engram-gemini).
     # Non-fatal: skipped gracefully when VIZ_OPERATOR has an invalid
     # charset, setfacl is absent, or no engram dir exists yet (agent
@@ -3052,14 +3053,15 @@ JSON
                 && sudo -u "$chosen_user" setfacl -R -d -m "u:${VIZ_OPERATOR}:rX" "$_engram_dir" 2>/dev/null \
                 && (( ++_viz_ok )) \
                 || { echo "  WARN: setfacl rX failed on $_engram_dir: $_setfacl_err" >&2; continue; }
-            # Write on config.json (only when rX succeeded — traversal is prerequisite).
+            # Read-only on config.json (#341; only when rX succeeded — traversal is prerequisite).
+            # Also NARROWS a seat that already carries rw.
             local _cfg="$_engram_dir/config.json"
-            [[ -f "$_cfg" ]] && sudo -u "$chosen_user" setfacl -m "u:${VIZ_OPERATOR}:rw" "$_cfg" 2>/dev/null \
+            [[ -f "$_cfg" ]] && sudo -u "$chosen_user" setfacl -m "u:${VIZ_OPERATOR}:rX" "$_cfg" 2>/dev/null \
                 && (( _viz_cfg_ok++ )) || true
         done
         if (( _viz_ok > 0 )); then
             _viz_acl_result="${VIZ_OPERATOR}: rX on ${_viz_ok} engram dir(s)"
-            (( _viz_cfg_ok > 0 )) && _viz_acl_result+=" + rw on ${_viz_cfg_ok} config.json"
+            (( _viz_cfg_ok > 0 )) && _viz_acl_result+=" + r on ${_viz_cfg_ok} config.json"
         elif (( _viz_skipped > 0 )); then
             _viz_acl_result="no ~/.engram* dir found yet — run 'sudo agentctl share ${chosen} ~/.engram --mode ro' after first session installs ENGRAM"
         else

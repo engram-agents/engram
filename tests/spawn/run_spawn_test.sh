@@ -145,7 +145,9 @@ if [ -L "$NEWBORN_HOME/.local/bin/claude" ]; then
 fi
 echo "  ✓ no claude symlink into another home"
 
-# Synthetic ACL tests: exercise the three behavioral paths of step 5.7.
+# Synthetic ACL tests: exercise the three behavioral paths of step 5.7
+# (operator READ-ONLY per #341; the u:root:rw cells below only exercise setfacl
+# mechanics, they are not what 5.7 grants).
 # The spawn test runs as root with SUDO_USER unset (Docker CMD), so the
 # operator-absent path fires for the real spawn above. We verify all three
 # paths synthetically below using temp directories.
@@ -171,11 +173,11 @@ else
 fi
 
 # Also verify that a file created INSIDE the dir inherits the default ACL
-# (this is the core mechanism: new files get operator rw without a stub).
+# (this is the core mechanism: new files get the default ACL without a stub).
 INNER_FILE="$TMP_DIR/config.json"
 touch "$INNER_FILE"
 if getfacl "$INNER_FILE" 2>/dev/null | grep -q "user:root:rw"; then
-    echo "  ✓ operator-present: new file inside dir inherits operator rw ACL"
+    echo "  ✓ operator-present: new file inside dir inherits the default ACL (mechanics only)"
 else
     echo "FAIL: operator-present: new file did not inherit default ACL" >&2
     getfacl "$INNER_FILE" >&2 || true

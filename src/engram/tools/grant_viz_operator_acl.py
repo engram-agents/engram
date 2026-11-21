@@ -26,9 +26,10 @@ seats, so nothing will ever consume one for them — this tool is the
 retroactive repair. Scoped to ``health-snapshots/`` specifically (narrower
 than the hook's whole-``~/.engram`` grant), matching the issue's own
 one-liner and Lei's "read-only for spt on snapshots, rw only on the config
-file" framing — this tool does not touch ``config.json`` at all; that grant
+file" framing (the config.json half of that framing was later narrowed to
+read-only, #341) — this tool does not touch ``config.json`` at all; that grant
 belongs to the (already-existing, in-repo) deferred-marker consumer, which
-handles config.json's own read-write grant separately.
+handles config.json's own read-only grant separately.
 
 Mask fix (engram-alpha#2720 item 2): every ``-m`` entry list here carries
 an explicit ``m::rX`` (and ``d:m::rX``) mask alongside the named grant, not
