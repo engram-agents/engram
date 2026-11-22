@@ -533,3 +533,59 @@ def test_B8_an_unreadable_file_with_a_new_text_fn_is_a_one_line_refusal_not_an_e
     assert msg is not None and "REFUSED" in msg and p.name in msg, msg
     assert len(msg.strip().splitlines()) == 1, msg
     assert p.read_bytes() == b"my rules\n" and _names(tmp_path) == ["CLAUDE.md"]
+
+
+# ---------------------------------------------------------------- the early refusal of an unreadable Codex config (follow-up to 4939)
+
+# Contract: a Codex config.toml that exists but cannot be read as UTF-8 text is refused when bootstrap BUILDS
+# the item, with the one "cannot read <path> as text" line and nothing written. That early refusal rests on the
+# item's first (predicted) text, not on `new_text_fn`; the guard's own refusal at write time words it
+# differently, so a cell that only checks "it was refused" would not notice the predicted text going missing.
+# The probe only builds the item: "file unchanged" and "nothing written beside it or in the ENGRAM home" are
+# guards against a future write-before-refuse, not something today's code could fail.
+_CODEX_UNREADABLE_PROBE = r"""
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import bootstrap
+cfg = Path(sys.argv[2])
+before = cfg.read_bytes()
+ids = dict(bootstrap._FIXED_SEED_IDS)
+subs = bootstrap._build_substitutions(ids, quiet=True)
+raised = None
+try:
+    bootstrap._write_items(ids, subs, "{}", None, bootstrap._predicted_agents_render())
+except BaseException as e:  # noqa: BLE001
+    raised = str(e)
+home = Path(sys.argv[3])
+print(json.dumps({"raised": raised, "unchanged": cfg.read_bytes() == before,
+                  "siblings": sorted(p.name for p in cfg.parent.iterdir() if p.name != cfg.name),
+                  "home_entries": sorted(p.name for p in home.iterdir())}))
+"""
+
+
+def test_unreadable_codex_config_is_refused_when_the_item_is_built_with_the_early_wording_4939(tmp_path):
+    engram_home = tmp_path / ".engram"
+    engram_home.mkdir()
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir()
+    cfg.write_bytes(b'[plugins.someone]\nkey = "\xff\xfe not utf-8"\n')
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(tmp_path), "ALPHA_DIR": str(REPO_ROOT), "ALPHA_TEMPLATES_DIR": str(SRC / "templates"),
+        "ENGRAM_HOME": str(engram_home), "CLAUDE_HOME": str(tmp_path / ".claude"),
+        "CODEX_HOME": str(tmp_path / ".codex"), "TARGET": "codex", "PYTHON_BIN": sys.executable,
+        "ENGRAM_NO_EMBEDDINGS": "1",
+    })
+    r = subprocess.run([sys.executable, "-c", _CODEX_UNREADABLE_PROBE, str(SRC), str(cfg), str(engram_home)],
+                       env=env, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:  # a broken probe is not the contract's observable
+        raise RuntimeError("the unreadable-config probe itself failed:\n" + r.stdout + r.stderr)
+    result = json.loads(r.stdout.strip().splitlines()[-1])
+    assert result["raised"] is not None, "building the item for an unreadable Codex config did not refuse at all"
+    assert result["raised"].startswith(f"[bootstrap] REFUSED: cannot read {cfg} as text"), (
+        f"refused, but not with the early line naming the config and 'as text': {result['raised']!r}"
+    )
+    assert result["unchanged"] is True, "the unreadable config was modified"
+    assert result["siblings"] == [], f"a backup or stamp was written next to the config: {result['siblings']}"
+    assert result["home_entries"] == [], f"building the item wrote into the ENGRAM home: {result['home_entries']}"
