@@ -708,16 +708,9 @@ the surface that carries it (Lei, 2026-08-29). Install is **per-user**:
 > generator or test binding them. Change one, change all three in the same
 > pass — **but the ruleset paragraph and any repo-specific merge-authority
 > clause are deliberately per-repo; sync the rules, not the local facts.**
-> Lei's 2026-09-15 01:01Z ruling ("the Soma review can just use the same
-> team-wide convention, no need for a special exception") retires the
-> 2026-09-14 interim exception that had carved soma out of the fairy-round-
-> timing clarification in "Mechanical check at the merge seat" above (issue
-> #2920) — this repo's own copy of the exception is removed by THIS PR.
-> The other two copies are separate, still-open PRs at time of writing:
-> soma's own transcription (soma#60) and umwelt's matching removal
-> (umwelt#816) — **do not read this note as "already synced across all
-> three"; it is synced once all three of this PR / soma#60 / umwelt#816
-> have merged.** The evidence behind this section — every dated measurement — now lives in
+> Wording-only tightening in one copy need not be propagated to the others; a
+> change to what a seat must do is made in all three in the same pass.
+> The evidence behind this section — every dated measurement — now lives in
 > engram's `docs/internal/GH-STACK.md`, and the sibling copies point there.
 
 ### PR inheritance — read the open PRs first; make status readable from the LIST

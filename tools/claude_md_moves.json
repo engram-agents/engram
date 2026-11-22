@@ -419,6 +419,12 @@
    "to_doc": "docs/internal/PR-ISSUE-CLOSURE.md",
    "first_sentence": "close form (the first draft missed it — exercised five ways by Ariadne,",
    "last_sentence": "`[closes #N]` merge before claiming either way."
+  },
+  {
+   "from_section": "Stacked PRs note: the 2026-09-15 transitional paragraph",
+   "to_doc": "docs/internal/GH-STACK.md",
+   "first_sentence": "Lei's 2026-09-15 01:01Z ruling (\"the Soma review can just use the same",
+   "last_sentence": "have merged.**"
   }
  ]
 }

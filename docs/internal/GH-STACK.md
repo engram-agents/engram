@@ -383,3 +383,18 @@ created a stack based on `main` and retargeted the bottom PR to `main`. A REST b
 change was then refused with HTTP 422 "Cannot change the base branch because the pull
 request is part of a stack". `gh stack unstack <stack number>` removed the stack, and
 the base could then be set back to `dev`.
+
+## Transitional note retired from CLAUDE.md (2026-11-22)
+
+Removed from the closing note of CLAUDE.md's Stacked PRs section because the three pull requests it names have merged. Text kept verbatim:
+
+Lei's 2026-09-15 01:01Z ruling ("the Soma review can just use the same
+team-wide convention, no need for a special exception") retires the
+2026-09-14 interim exception that had carved soma out of the fairy-round-
+timing clarification in "Mechanical check at the merge seat" above (issue
+#2920) — this repo's own copy of the exception is removed by THIS PR.
+The other two copies are separate, still-open PRs at time of writing:
+soma's own transcription (soma#60) and umwelt's matching removal
+(umwelt#816) — **do not read this note as "already synced across all
+three"; it is synced once all three of this PR / soma#60 / umwelt#816
+have merged.**
