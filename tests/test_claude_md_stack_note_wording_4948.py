@@ -55,8 +55,11 @@ def test_c1_sentence_occurs_once():
 
 
 def test_c2_sentence_sits_in_the_stack_note():
-    flat = " ".join(_stack_block().replace("\n> ", " ").split())
-    note = flat.index("> **Duplicated by hand")
+    flat = " ".join(
+        (line[2:] if line.startswith("> ") else line) for line in _stack_block().splitlines()
+    )
+    flat = " ".join(flat.split())
+    note = flat.index("**Duplicated by hand")
     anchor = flat.index("sync the rules, not the local facts.", note)
     assert flat.index(SENTENCE) > anchor
     assert flat.index(SENTENCE) > note
