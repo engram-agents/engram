@@ -42,6 +42,14 @@ OTHER_NOTE_OPENINGS = [
     ),
 ]
 
+# Last lines of the same three notes, pinned as whole lines (reviewer round 1: the
+# opening pins cannot see a deletion at the end of a note).
+OTHER_NOTE_LAST_LINES = [
+    "> these three copies document one mechanism, never three copies of it.",
+    "> on the one governing the repo you are in.",
+    "> the sibling copies point.",
+]
+
 
 def _stack_block():
     start = CLAUDE.index("### Stacked PRs (")
@@ -70,7 +78,7 @@ def test_c2_sentence_sits_in_the_stack_note():
 
 
 def test_c3_stale_paragraph_moved_to_the_doc():
-    for gone in ("soma#60", "umwelt#816", RULING):
+    for gone in ("soma#60", "umwelt#816", "THIS PR", RULING):
         assert gone not in CLAUDE, gone
     assert DOC.count(HEADING + "\n") == 1
     assert DOC.count(RULING) == 1
@@ -90,3 +98,6 @@ def test_c4_moves_entry_for_the_stack_note():
 def test_c5_other_duplicated_by_hand_notes_untouched():
     for opening in OTHER_NOTE_OPENINGS:
         assert CLAUDE.count(opening) == 1, opening
+    lines = CLAUDE.split("\n")
+    for last in OTHER_NOTE_LAST_LINES:
+        assert lines.count(last) == 1, last
