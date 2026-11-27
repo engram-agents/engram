@@ -357,8 +357,7 @@ def anchor(claim: str, quoted_text: str) -> AnchoringResult:
 
 
 # Below this quote-claim cosine similarity the write-time anchoring advisory
-# raises the `low_similarity` flag in its `flags` list (#4050 part a; #4847: it was a
-# `low_similarity_hint` sentence before). Advisory only; one spelling.
+# adds `low_similarity_hint` (#4050 part a). Advisory only; one spelling.
 LOW_QUOTE_CLAIM_SIMILARITY = 0.2
 
 

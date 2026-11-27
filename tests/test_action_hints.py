@@ -109,9 +109,8 @@ def test_corroborate_at_high_similarity():
                         target_claim="Original anchor claim about topic Z.")
     r = _add_second_obs(server, claim="Independent confirmation of topic Z claim.")
     assert r.get("similar_count", 0) >= 1, r
-    # #4847 (D2), changed on purpose: a tier-B entry carries its severity, no action_hint prose; the lead says the action.
-    hint = r["similar_existing"][0]["severity"]
-    assert hint == "corroborate", f"Expected CORROBORATE, got: {hint}"
+    hint = r["similar_existing"][0]["action_hint"]
+    assert hint.startswith("CORROBORATE"), f"Expected CORROBORATE, got: {hint}"
 
 
 def test_related_at_moderate_similarity():
@@ -152,9 +151,8 @@ def test_corroborate_at_exact_threshold():
     _stub_semantic_with(server, similarity=0.65, target_id=first_id,
                         target_claim="Original anchor claim about topic Z.")
     r = _add_second_obs(server, claim="Boundary-case topic Z claim.")
-    # #4847 (D2), changed on purpose: a tier-B entry carries its severity, no action_hint prose; the lead says the action.
-    hint = r["similar_existing"][0]["severity"]
-    assert hint == "corroborate", (
+    hint = r["similar_existing"][0]["action_hint"]
+    assert hint.startswith("CORROBORATE"), (
         f"sim==0.65 should be CORROBORATE (>= boundary), got: {hint}"
     )
 
@@ -175,17 +173,15 @@ def test_related_at_exact_threshold():
 # ── Hint string contains similarity number for agent context ───────────────
 
 
-def test_tier_b_entry_carries_no_similarity_value():
-    """#4847 (D2), changed on purpose: the similarity figure of a tier-B match lived only in the
-    action_hint prose and goes with it; the severity word encodes the band."""
+def test_hint_contains_similarity_value():
+    """Each hint embeds the (sim:.2f) value so the agent can sanity-check."""
     server = fresh_server()
     first_id = _seed_first_obs(server)
     _stub_semantic_with(server, similarity=0.71, target_id=first_id,
                         target_claim="Original anchor claim about topic Z.")
     r = _add_second_obs(server, claim="Topic Z claim variant.")
-    entry = r["similar_existing"][0]
-    assert entry["severity"] == "corroborate"
-    assert "0.71" not in json.dumps(entry), entry
+    hint = r["similar_existing"][0]["action_hint"]
+    assert "0.71" in hint, f"Hint missing similarity value: {hint}"
 
 
 # ── Config overrides actually drive the tier boundaries ───────────────────

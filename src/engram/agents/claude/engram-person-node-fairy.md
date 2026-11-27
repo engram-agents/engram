@@ -70,8 +70,7 @@ report, don't adjudicate). Suggested actions: metadata repair via
 with both nodes' snapshots.
 
 **P5 — Unwired person-mentions.**
-The write path surfaces a `person_mentions` entry (the person's id and name; it used to
-carry a "wire an about-edge?" sentence) whenever a claim names a person, and those entries
+The write path surfaces "mentions <name> — wire an about-edge?" hints that
 often go unwired. P5 **measures a rate**, and a rate does not imply a norm.
 Whether about-edges ought to be wired systematically or stay
 sparse, curated links is a design call that belongs to the maintainer, and a

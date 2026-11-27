@@ -313,9 +313,7 @@ def test_b_tier_b_uses_recall_summary_never_full_claim():
     corr = [e for e in _shown(r) if e["severity"] == "corroborate"]
     assert len(corr) == 3
     for e in corr:
-        # #4847 (D2), changed on purpose: no action_hint prose in a tier-B entry; the
-        # lead says the action once.
-        assert set(e) == {"id", "severity", "recall_summary", "confidence"}, e
+        assert set(e) == {"id", "severity", "recall_summary", "confidence", "action_hint"}, e
     by_id = {e["id"]: e for e in corr}
     summaries = sorted(e["recall_summary"] for e in corr)
     assert "corroborating summary 1" in summaries and "corroborating summary 2" in summaries
@@ -442,8 +440,7 @@ def test_c_lead_never_says_weak_match_and_caps_ids_at_3():
     assert "WEAK_MATCH" not in lead and "weak" not in lead.lower()
     assert lead.startswith("5 corroboration candidates: ")
     assert sum(1 for n in ids if n in lead) == 3
-    # #4847 (D2), changed on purpose: the lead now closes each phrase with its action.
-    assert " and 2 more (" in lead and lead.endswith(")")
+    assert lead.endswith("and 2 more")
     r2, expected, _ = write_mixed(fresh_server())
     assert "WEAK_MATCH" not in json.dumps(r2["similar_existing_lead"])
     assert "WEAK_MATCH" not in r2["similar_not_shown"]["see"]
