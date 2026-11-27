@@ -67,45 +67,35 @@ def _write(server, monkeypatch, sim, reason=None, **overrides):
     return r
 
 
-def _low(adv):
-    """#4847 (D4), changed on purpose: the low-similarity SENTENCE is gone from the reply;
-    the threshold crossed is named in `advisory["flags"]` (what the flag means is said once,
-    in the engram_add_observation tool description). A cell that asserts the sentence's
-    ABSENCE would now pass vacuously, so every 'not fired' cell asserts the flag's absence."""
-    return "low_similarity" in adv.get("flags", [])
-
-
 def test_L1_below_threshold_key_present_exact_text(monkeypatch):
     server = fresh_server()
     adv = _write(server, monkeypatch, 0.19)["anchoring_advisory"]
-    assert _low(adv) and "low_similarity_hint" not in adv
-    assert adv["quote_claim_similarity"] == 0.19
+    assert adv["low_similarity_hint"] == EXPECTED_TEXT.format(sim="0.19")
 
 
 def test_L2_exactly_threshold_key_absent(monkeypatch):
     server = fresh_server()
     adv = _write(server, monkeypatch, 0.2)["anchoring_advisory"]
-    assert not _low(adv)
+    assert "low_similarity_hint" not in adv
 
 
 def test_L3_above_threshold_key_absent(monkeypatch):
     server = fresh_server()
     adv = _write(server, monkeypatch, 0.21)["anchoring_advisory"]
-    assert not _low(adv)
+    assert "low_similarity_hint" not in adv
 
 
 def test_L4_none_similarity_never_gives_key(monkeypatch):
     server = fresh_server()
     adv = _write(server, monkeypatch, None, reason="embedder unavailable")["anchoring_advisory"]
-    assert not _low(adv)
+    assert "low_similarity_hint" not in adv
     assert adv["similarity_status"] == "unavailable: embedder unavailable"
 
 
 def test_L5_non_hard_data_quote_type_still_gets_key(monkeypatch):
     server = fresh_server()
     adv = _write(server, monkeypatch, 0.05, quote_type="official_statement")["anchoring_advisory"]
-    assert _low(adv) and "low_similarity_hint" not in adv
-    assert adv["quote_claim_similarity"] == 0.05
+    assert adv["low_similarity_hint"] == EXPECTED_TEXT.format(sim="0.05")
 
 
 def test_L6_independent_of_existing_hint(monkeypatch):
@@ -115,11 +105,14 @@ def test_L6_independent_of_existing_hint(monkeypatch):
     both = _write(server, monkeypatch, 0.05, **kwargs)["anchoring_advisory"]
     server = fresh_server()
     plain = _write(server, monkeypatch, 0.5, **kwargs)["anchoring_advisory"]
-    # #4847 (D4): the two sentences are flags now; the two flags stay independent
-    assert "hint" not in both and "low_similarity_hint" not in both
-    assert both["flags"] == ["hard_data_unanchored", "low_similarity"], both
-    assert plain["flags"] == ["hard_data_unanchored"], plain
-    assert not _low(plain)
+    assert "hint" in both and "low_similarity_hint" in both
+    assert both["hint"] == plain["hint"]
+    assert both["hint"] == (
+        "hard_data: 2 claim token(s) absent from the "
+        "quote — widen the quote, move the fact to `interpretation`, or "
+        "downgrade quote_type. Advisory only (#2602 facet 2)."
+    )
+    assert "low_similarity_hint" not in plain
 
 
 def _log_rows(server):
@@ -159,34 +152,33 @@ def test_L8_batch_only_low_item_has_key(monkeypatch):
     r = json.loads(server.engram_add_observation_batch(payload_json=json.dumps(payload)))
     assert r.get("created") == 2, r
     advs = [x["anchoring_advisory"] for x in sorted(r["results"], key=lambda x: x["index"])]
-    assert _low(advs[0])
-    assert not _low(advs[1])
+    assert "low_similarity_hint" in advs[0]
+    assert "low_similarity_hint" not in advs[1]
 
 
 def test_L9_constant_pinned_and_text_derived_from_it(monkeypatch):
     server = fresh_server()
     from engram_anchoring import LOW_QUOTE_CLAIM_SIMILARITY
     assert LOW_QUOTE_CLAIM_SIMILARITY == 0.2
-    # #4847 (D4): the sentence that derived its number from the constant is gone; the
-    # flag is the constant's only reader in the reply. Pin both sides of it.
-    assert _low(_write(server, monkeypatch, 0.01)["anchoring_advisory"])
-    assert _low(_write(server, monkeypatch, LOW_QUOTE_CLAIM_SIMILARITY - 1e-6)["anchoring_advisory"])
-    assert not _low(_write(server, monkeypatch, LOW_QUOTE_CLAIM_SIMILARITY)["anchoring_advisory"])
+    adv = _write(server, monkeypatch, 0.01)["anchoring_advisory"]
+    text = adv["low_similarity_hint"]
+    assert f"is below {LOW_QUOTE_CLAIM_SIMILARITY:g}:" in text
+    m = re.search(r"is below (\S+):", text)
+    assert m and m.group(1) == f"{LOW_QUOTE_CLAIM_SIMILARITY:g}"
 
 
 def test_L10_display_never_rounds_up_to_threshold(monkeypatch):
-    # #4847 (D4): 0.1999 < 0.2 fires; the reply shows the raw number, never a rounded one
-    # that could read "0.20 is below 0.2".
+    # 0.1999 < 0.2 fires, but {:.2f} would print "0.20 is below 0.2".
     server = fresh_server()
     adv = _write(server, monkeypatch, 0.1999)["anchoring_advisory"]
-    assert _low(adv)
-    assert adv["quote_claim_similarity"] == 0.1999
+    assert "low_similarity_hint" in adv
+    assert "0.19 is below 0.2" in adv["low_similarity_hint"]
 
 
 def test_L11a_nan_similarity_never_gives_key(monkeypatch):
     server = fresh_server()
     adv = _write(server, monkeypatch, float("nan"))["anchoring_advisory"]
-    assert not _low(adv)
+    assert "low_similarity_hint" not in adv
     rows = _log_rows(server)
     assert len(rows) == 1
     assert rows[0]["low_similarity"] is False
@@ -205,4 +197,4 @@ def test_L11b_raising_similarity_gives_unavailable_advisory(monkeypatch):
     adv = r["anchoring_advisory"]
     assert adv["status"] == "unavailable"
     assert "embedder exploded" in adv["reason"]
-    assert not _low(adv)
+    assert "low_similarity_hint" not in adv

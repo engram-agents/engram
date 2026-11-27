@@ -319,16 +319,14 @@ third is also named in the description of each write tool that returns it:
 
 - **`anchoring_advisory`** — measures how many of the claim's hard facts (node ids, issue/PR refs,
   hex shas, 3+-digit numbers, dates/times) are literal substrings of `quoted_text`. When
-  `quote_type=hard_data` has unanchored tokens the response names it in `flags`
-  (`hard_data_unanchored`): widen the quote, move the fact to `interpretation`, or downgrade the
-  quote type (#4847: this used to be a `hint` sentence on every such write). Advisory only —
+  `quote_type=hard_data` has unanchored tokens the response itself sets a `hint` telling you to
+  widen the quote, move the fact to `interpretation`, or downgrade the quote type. Advisory only —
   it never refuses a write or changes a confidence. This is advisory-only **until #2602 facet 3**;
   facet 3 (the refusal behavior) is still out of scope for what's shipped today, so treat this as
   conditional rather than a permanent guarantee. Separately, when the quote-claim similarity is
-  below 0.2 the advisory's `flags` also carry `low_similarity` (any quote type; it can sit beside
-  `hard_data_unanchored`): the quote may not carry the claim, so widen the quote, narrow the claim,
-  or move the rest into a derivation. Advisory only, and never set when the similarity could not
-  be measured.
+  below 0.2 the advisory also carries `low_similarity_hint` (any quote type; it can sit beside
+  `hint`): the quote may not carry the claim, so widen the quote, narrow the claim, or move the
+  rest into a derivation. Advisory only, and never set when the similarity could not be measured.
 - **`predictive_hint`** — appears when `predicted_event`/`resolution_timeframe` were passed without
   `is_predictive`. Advisory only; suppressed whenever `is_predictive` is true.
 - **`recall_summary_overrun`** — appears only when the stripped `recall_summary` is over the 140
